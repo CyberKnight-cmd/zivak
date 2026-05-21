@@ -1,0 +1,3 @@
+Goal: Build all agents and orchestrator that can work with mock data first, then plug into real databases later.
+
+Strategy: Build each component with a mock interface, test independently, then swap mocks for real DB clients.

@@ -1,0 +1,31 @@
+zivak/
+├── agents/
+│   ├── __init__.py
+│   ├── question_selector.py      # ← LLM agent
+│   ├── evidence_evaluator.py     # ← LLM agent
+│   └── tests/
+│       ├── test_question_selector.py
+│       └── test_evidence_evaluator.py
+│
+├── engines/
+│   ├── __init__.py
+│   ├── differential.py            # ← Pure Python math
+│   ├── confidence_judge.py        # ← Pure Python logic
+│   └── tests/
+│       ├── test_differential.py
+│       └── test_confidence_judge.py
+│
+├── orchestrator/
+│   ├── __init__.py
+│   ├── orchestrator.py            # ← Main state machine
+│   ├── mock_clients.py            # ← Mock DB clients for testing
+│   └── tests/
+│       └── test_orchestrator.py
+│
+├── knowledge/                      # ← Real DB clients (partner provides)
+│   ├── __init__.py
+│   ├── neo4j_client.py            # ← Initially mock, replace later
+│   └── qdrant_client.py           # ← Initially mock, replace later
+│
+├── cli_test.py                    # ← Simple terminal interface
+└── requirements.txt
