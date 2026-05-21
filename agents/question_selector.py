@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import time
-from typing import List, Dict
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -65,14 +65,31 @@ class QuestionSelectorAgent:
     def __init__(self, model: str = "openai/gpt-oss-120b", temperature: float = 1):
         self.llm = _build_llm(model, temperature, groq_reasoning="medium")
 
-    def select_question(self, differential: List[Dict], available_tests: List[Dict]) -> Dict:
+    def select_question(
+        self,
+        differential: List[Dict],
+        available_tests: List[Dict],
+        test_lr_map: Optional[Dict[str, List[Dict]]] = None,
+        symptom: Optional[str] = None,
+        qa_history: Optional[List[Dict]] = None,
+    ) -> Dict:
         """
         Select the best question to ask next.
+
+        Args:
+            differential:    Current disease probabilities (sorted descending).
+            available_tests: Tests not yet asked; each has id, name, diseases.
+            test_lr_map:     Optional mapping of test_id → LR edge list from Neo4j.
+                             When provided, LR magnitudes are shown in the prompt so
+                             the LLM can prefer high-information tests (N1 fix).
+            symptom:         Original patient complaint, shown as context (N4 fix).
+            qa_history:      Prior Q&A turns as list of dicts with 'question' and
+                             optional 'answer' keys (N4 fix).
 
         Raises:
             RuntimeError: if all retry attempts fail.
         """
-        prompt = self._build_prompt(differential, available_tests)
+        prompt   = self._build_prompt(differential, available_tests, test_lr_map, symptom, qa_history)
         last_exc: Exception = None
 
         for attempt in range(MAX_RETRIES):
@@ -98,28 +115,75 @@ class QuestionSelectorAgent:
             f"QuestionSelectorAgent failed after {MAX_RETRIES} attempts"
         ) from last_exc
 
-    def _build_prompt(self, differential: List[Dict], available_tests: List[Dict]) -> str:
+    def _build_prompt(
+        self,
+        differential: List[Dict],
+        available_tests: List[Dict],
+        test_lr_map: Optional[Dict[str, List[Dict]]] = None,
+        symptom: Optional[str] = None,
+        qa_history: Optional[List[Dict]] = None,
+    ) -> str:
+        # --- Context block (symptom + history) ---
+        context_block = ""
+        if symptom:
+            context_block += f"Patient presenting complaint: {symptom!r}\n\n"
+        if qa_history:
+            context_block += "Evidence collected so far:\n"
+            for i, qa in enumerate(qa_history, 1):
+                answer_part = f": {qa['answer']}" if qa.get("answer") else ""
+                context_block += f"  Turn {i} — {qa['question']}{answer_part}\n"
+            context_block += "\n"
+
+        # --- Differential block ---
         diff_text = "\n".join(
             f"{i+1}. {d['name']}: {d['probability']*100:.1f}%"
             for i, d in enumerate(differential[:5])
         )
-        tests_text = "\n".join(
-            f"- {t['name']} (ID: {t['id']}): relevant for {', '.join(t['diseases'])}"
-            for t in available_tests
+
+        # --- Tests block ---
+        # When LR data is available, show numeric LRs so the LLM can distinguish
+        # test_hrct (ILD LR≈20.0) from test_cxr_hyp (COPD LR≈4.2).
+        # Only RULES_IN LRs are shown — they are the most actionable for selection.
+        def _fmt_test(t: Dict) -> str:
+            if test_lr_map:
+                edges = test_lr_map.get(t["id"], [])
+                lr_parts = [
+                    f"{e['disease']} LR≈{e['lr']}"
+                    for e in edges
+                    if e["relationship"] == "RULES_IN"
+                ]
+                # Fallback to disease list if no RULES_IN edges found for this test
+                if lr_parts:
+                    return f"- {t['name']} (ID: {t['id']}): {', '.join(lr_parts)}"
+            return f"- {t['name']} (ID: {t['id']}): relevant for {', '.join(t['diseases'])}"
+
+        has_lr = bool(test_lr_map)
+        tests_header = (
+            "Available tests (LR values show how strongly a positive result shifts probability):"
+            if has_lr else
+            "Available tests:"
         )
+        tests_text = "\n".join(_fmt_test(t) for t in available_tests)
+
+        lr_criterion = (
+            "2. Prefer tests with higher LR values — they produce larger probability shifts"
+            if has_lr else
+            "2. Has strong likelihood ratios (changes probability significantly)"
+        )
+
         return f"""You are ZIVAK's Question Selector Agent.
 
 Your task: Pick the SINGLE diagnostic test that will most reduce uncertainty in the differential diagnosis.
 
-Current differential diagnosis:
+{context_block}Current differential diagnosis:
 {diff_text}
 
-Available tests:
+{tests_header}
 {tests_text}
 
 Selection criteria:
 1. Discriminates between top candidates (ideally tests that differ between #1 and #2)
-2. Has strong likelihood ratios (changes probability significantly)
+{lr_criterion}
 3. Is clinically practical to obtain
 
 Output ONLY valid JSON with this exact structure:

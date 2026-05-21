@@ -3,9 +3,12 @@ Differential Engine - Bayesian probability updates
 No LLM required - pure mathematics
 """
 
+import logging
 import math
 from typing import List, Dict
 from copy import deepcopy
+
+logger = logging.getLogger(__name__)
 
 # Probability floor for rare disease seeder (blueprint spec: 2% minimum prior)
 RARE_DISEASE_FLOOR = 0.02
@@ -76,11 +79,26 @@ class DifferentialEngine:
         Args:
             evidence: Dict with 'rules_in' and 'rules_out' lists.
                       Each entry has 'disease' and 'likelihood_ratio'.
+                      rules_in  LRs should be > 1 (evidence boosting the disease).
+                      rules_out LRs should be < 1 (evidence penalising the disease).
 
         Returns:
             Updated differential sorted by probability.
         """
         self.evidence_history.append(deepcopy(evidence))
+        self._validate_evidence(evidence)
+
+        # Warn when the same disease appears in both lists — both LRs still applied
+        # (net = log(lr_in) + log(lr_out)), but this is almost always an authoring error.
+        rules_in_keys  = {r['disease'].lower().strip() for r in evidence.get('rules_in',  [])}
+        rules_out_keys = {r['disease'].lower().strip() for r in evidence.get('rules_out', [])}
+        overlap = rules_in_keys & rules_out_keys
+        if overlap:
+            logger.warning(
+                "DifferentialEngine: disease(s) %s appear in both rules_in and rules_out — "
+                "both LRs applied; net log-LR is their sum (likely an authoring error)",
+                overlap,
+            )
 
         # Build log-LR map: sum log(LR) per disease (= multiply LRs in prob space)
         log_lr_map: Dict[str, float] = {}
@@ -106,6 +124,34 @@ class DifferentialEngine:
 
         self.differential = sorted(self.differential, key=lambda x: x['probability'], reverse=True)
         return self.differential
+
+    def _validate_evidence(self, evidence: Dict) -> None:
+        """
+        Warn when LR values violate the expected direction invariant.
+
+        rules_in  entries should have LR > 1 (positive evidence boosting a disease).
+        rules_out entries should have LR < 1 (positive evidence penalising a disease).
+
+        Violations don't crash the engine — the math still runs — but they almost
+        certainly indicate a knowledge-base authoring error (e.g. a penalising LR
+        accidentally placed in rules_in), so each violation gets a warning.
+        """
+        for rule in evidence.get('rules_in', []):
+            lr = rule.get('likelihood_ratio', 1.0)
+            if lr < 1.0:
+                logger.warning(
+                    "DifferentialEngine: rules_in entry for %r has LR=%.4f < 1 "
+                    "(expected > 1 for boosting evidence — check knowledge base)",
+                    rule.get('disease'), lr,
+                )
+        for rule in evidence.get('rules_out', []):
+            lr = rule.get('likelihood_ratio', 1.0)
+            if lr > 1.0:
+                logger.warning(
+                    "DifferentialEngine: rules_out entry for %r has LR=%.4f > 1 "
+                    "(expected < 1 for penalising evidence — check knowledge base)",
+                    rule.get('disease'), lr,
+                )
 
     def get_top_n(self, n: int = 3) -> List[Dict]:
         return self.differential[:n]

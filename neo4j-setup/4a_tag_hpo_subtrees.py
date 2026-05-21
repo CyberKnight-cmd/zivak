@@ -33,7 +33,7 @@ load_dotenv()
 
 SCRIPT_DIR     = Path(__file__).resolve().parent
 DATA_DIR       = Path(os.getenv("DATA_DIR",       str(SCRIPT_DIR.parent / "data")))
-ONTOLOGIES_DIR = Path(os.getenv("ONTOLOGIES_DIR", str(SCRIPT_DIR.parent / "data" / "ontologies")))
+ONTOLOGIES_DIR = Path(os.getenv("ONTOLOGIES_DIR", str(SCRIPT_DIR.parent / "data")))
 PROCESSED_DIR  = DATA_DIR / "processed"
 
 SYMPTOM_INDEX = PROCESSED_DIR / "symptom_index.json"

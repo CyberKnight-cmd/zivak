@@ -1,390 +1,365 @@
 """
-Multi-scenario diagnostic runner.
+run_scenarios.py — LLM-powered rare-disease diagnostic scenario runner.
 
-Exercises every disease in the mock knowledge graph by running one
-automated session per scenario. Each scenario supplies concise,
-disease-specific answers so the differential converges toward the
-expected diagnosis without wasting tokens.
-
-Diseases covered:
-  Exertional Dyspnoea: COPD, Asthma, Heart Failure, Pulmonary Embolism,
-                       Pneumonia, Anemia, Interstitial Lung Disease
-  Palpitations:        Atrial Fibrillation, SVT, Anxiety, Hyperthyroidism
-  Vertigo:             BPPV, Vestibular Neuritis, Meniere's Disease, Central Vertigo
+Drives the ZIVAK orchestrator against the real Neo4j graph (HPO/Orphanet corpus).
+A Groq-backed simulator answers diagnostic questions creatively so the whole
+pipeline can run end-to-end without GPU conflicts.
+Every session is recorded to reports/runs/<timestamp>.json for analysis.
 
 Usage:
-  python run_scenarios.py
-  python run_scenarios.py --filter COPD Asthma BPPV
-  python run_scenarios.py --delay 90 --turn-delay 5   # rate-limit tuning
-  python run_scenarios.py --verbose
+  uv run run_scenarios.py
+  uv run run_scenarios.py --filter Prader-Willi Kabuki CHARGE
+  uv run run_scenarios.py --verbose --delay 5 --turn-delay 2
+  uv run run_scenarios.py --simulator-model llama-3.1-8b-instant
+  uv run run_scenarios.py --no-log
+
+Environment:
+  GROQ_API_KEY    Required — patient simulator (keeps GPU free for orchestrator)
+  LOCAL_LLM_URL   Ollama endpoint for the orchestrator (default: http://localhost:11434/v1)
 """
 
 import argparse
+import json
+import logging
+import os
+import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from orchestrator.mock_clients import MockNeo4jClient, MockQdrantClient
+from dotenv import load_dotenv
+load_dotenv()
+
+from orchestrator.mock_clients import get_clients
 from orchestrator.orchestrator import DiagnosticOrchestrator
 
-# ------------------------------------------------------------------ #
-#  Answers keyed by test_id — concise so the evaluator LLM call is   #
-#  token-light. One clear sentence is enough; no repetition.         #
-# ------------------------------------------------------------------ #
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
-# Per-scenario overrides come first; these are the disease-targeted answers.
-# FALLBACK_ANSWERS covers any test not listed in a scenario.
-# DEFAULT_ANSWER is the last resort (treats the test as normal/negative).
-
-FALLBACK_ANSWERS: dict[str, str] = {
-    # All fallbacks are NORMAL / NEGATIVE so that a test asked in the wrong scenario
-    # does not inject false evidence. Scenario-specific answers override these.
-    "test_fev1":      "FEV1/FVC 0.79 — normal spirometry",
-    "test_bronch":    "FEV1 +3% — no significant reversibility",
-    "test_peak_flow": "Diurnal variability <8% — not consistent with asthma",
-    "test_cxr_hyp":   "Normal CXR — no hyperinflation or cardiomegaly",
-    "test_bnp":       "BNP 42 pg/mL — normal",
-    "test_echo":      "EF 62%, normal LV size and function",
-    "test_cxr_card":  "Normal cardiac silhouette — no cardiomegaly",
-    "test_ddimer":    "D-dimer 0.28 mg/L — normal",
-    "test_ctpa":      "No pulmonary embolism identified",
-    "test_wells":     "Wells score 1 — low clinical probability",
-    "test_cxr_inf":   "Clear lung fields — no consolidation",
-    "test_sputum":    "No significant pathogens isolated",
-    "test_crp":       "CRP 3 mg/L, WBC 6.8 — normal",
-    "test_cbc":       "Hb 14.4 g/dL, MCV 88 — normal blood count",
-    "test_ferritin":  "Ferritin 74 ng/mL — normal iron stores",
-    "test_hrct":      "Normal HRCT — no parenchymal abnormality",
-    "test_pft":       "Normal spirometry and lung volumes",
-    "test_ecg":       "Normal sinus rhythm — no arrhythmia",
-    "test_holter":    "Normal sinus rhythm throughout 24h recording",
-    "test_echo_pal":  "Normal cardiac structure and function",
-    "test_electro":   "Electrolytes all within normal range",
-    "test_gad7":      "GAD-7 2 — minimal/no anxiety",
-    "test_tsh":       "TSH 1.9, fT4 14.2 — normal thyroid function",
-    "test_dix":       "Negative Dix-Hallpike bilaterally — no positional nystagmus",
-    "test_roll":      "Negative supine roll test bilaterally",
-    "test_hit":       "Negative HIT — intact VOR, no corrective saccade",
-    "test_vng":       "Normal VNG — symmetric caloric responses bilaterally",
-    "test_audio":     "Normal hearing bilaterally",
-    "test_tymp":      "Type A tympanograms bilaterally — middle ear normal",
-    "test_mri":       "Normal MRI brain — no lesion identified",
-}
-
-DEFAULT_ANSWER = "Normal / negative"
 
 # ------------------------------------------------------------------ #
-#  Scenario definitions                                               #
+#  Patient Simulator                                                  #
+# ------------------------------------------------------------------ #
+
+_SIM_RETRIES = 3
+_SIM_BACKOFF = 1.0
+
+_SIMULATOR_PROMPT = """\
+You are simulating a clinical encounter. The patient presents with:
+"{symptom}"
+
+A diagnostic test result is being reviewed. Decide creatively whether the \
+finding is POSITIVE (present/abnormal) or NEGATIVE (absent/normal), then give \
+a brief clinical response.
+
+Test / question: {question}
+
+Reply in 1-2 sentences. State clearly if the finding is present or absent and \
+add one plausible clinical detail. No caveats or hedging."""
+
+
+class PatientSimulatorAgent:
+    """
+    Groq-backed patient simulator. Answers HPO diagnostic questions with a
+    plausible positive or negative result. Runs entirely via the API so it
+    does not compete with the orchestrator's local Ollama model for GPU VRAM.
+    """
+
+    def __init__(self, model: str | None = None):
+        self.model = model or "llama-3.3-70b-versatile"
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        if not groq_key:
+            raise RuntimeError(
+                "GROQ_API_KEY is not set. The patient simulator requires Groq "
+                "so it does not compete with the orchestrator for GPU VRAM."
+            )
+        from langchain_groq import ChatGroq
+        self._llm = ChatGroq(
+            model=self.model,
+            temperature=1,   # randomness so answers vary across sessions
+            max_tokens=120,
+            api_key=groq_key,
+        )
+        logger.info("PatientSimulator: groq/%s", self.model)
+
+    def answer(self, question: str, symptom: str, scenario_name: str) -> str:
+        prompt = _SIMULATOR_PROMPT.format(symptom=symptom, question=question)
+
+        for attempt in range(_SIM_RETRIES):
+            try:
+                response = self._llm.invoke(prompt)
+                content  = response.content.strip()
+                content  = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+                if content:
+                    return content
+                raise ValueError("empty response")
+            except Exception as exc:
+                if attempt < _SIM_RETRIES - 1:
+                    time.sleep(_SIM_BACKOFF * (2 ** attempt))
+                else:
+                    logging.warning("PatientSimulator failed (%s) — using fallback", exc)
+        return "Negative — no abnormality detected for this finding."
+
+
+# ------------------------------------------------------------------ #
+#  Scenarios                                                          #
+#  All diseases are from the HPO/Orphanet rare-disease graph loaded  #
+#  in Neo4j. Disease names must EXACTLY match Neo4j node names.      #
 # ------------------------------------------------------------------ #
 
 SCENARIOS = [
-    # ===== Exertional Dyspnoea =====
     {
-        "name":     "COPD",
-        "symptom":  "I get winded very easily, especially going upstairs — I smoked for 30 years",
-        "expected": "COPD",
-        "answers": {
-            "test_fev1":      "FEV1/FVC 0.55 post-BD; fixed obstruction",
-            "test_bronch":    "FEV1 +3% — no significant reversibility",
-            "test_peak_flow": "<10% diurnal variability — not asthma",
-            "test_cxr_hyp":   "Hyperinflated, barrel chest, flattened diaphragms",
-            "test_hrct":      "Centrilobular emphysema + bullae, upper lobes",
-            "test_pft":       "Obstruction, air trapping: RV 175%, DLCO 60%",
-        },
+        "name":     "Prader-Willi",
+        "symptom":  "infant born floppy with weak cry and poor feeding, now an obese child with intellectual disability and behavioral problems",
+        "expected": "Prader-Willi syndrome",
     },
     {
-        "name":     "Asthma",
-        "symptom":  "I get breathless climbing stairs — worse at night and in cold air",
-        "expected": "Asthma",
-        "answers": {
-            "test_fev1":      "FEV1/FVC 0.68 pre-BD, 0.80 post-BD — reversible obstruction",
-            "test_bronch":    "FEV1 +22% after salbutamol — reversibility confirms asthma",
-            "test_peak_flow": "28% diurnal variability — consistent with asthma",
-            "test_cxr_hyp":   "Normal CXR — no hyperinflation",
-            "test_hrct":      "Mild bronchial wall thickening; no emphysema",
-        },
+        "name":     "Kabuki",
+        "symptom":  "child with global developmental delay, distinctive wide eyes, broad nasal tip, and persistent fetal fingertip pads",
+        "expected": "Kabuki syndrome",
     },
     {
-        "name":     "Heart Failure",
-        "symptom":  "short of breath on exertion, swollen ankles, waking up gasping at night",
-        "expected": "Heart Failure",
-        "answers": {
-            "test_bnp":       "BNP 1200 pg/mL — markedly elevated",
-            "test_echo":      "EF 25%, dilated LV, global systolic dysfunction",
-            "test_cxr_card":  "Cardiomegaly, bilateral oedema, Kerley B lines",
-            "test_fev1":      "FEV1/FVC 0.76 — normal spirometry",
-            "test_bronch":    "No reversibility — not asthma",
-            "test_ddimer":    "D-dimer 0.6 mg/L — mildly elevated, cardiac cause likely",
-        },
+        "name":     "Noonan",
+        "symptom":  "short child with widely spaced eyes, drooping eyelids, webbed neck, and a heart murmur since birth",
+        "expected": "Noonan syndrome",
     },
     {
-        "name":     "Pulmonary Embolism",
-        "symptom":  "I feel like I am suffocating during exercise and my left calf is red and swollen",
-        "expected": "Pulmonary Embolism",
-        "answers": {
-            "test_ddimer":    "D-dimer 4.2 mg/L — significantly elevated",
-            "test_ctpa":      "Bilateral saddle PE confirmed in main pulmonary arteries",
-            "test_wells":     "Wells 7 — high probability",
-            "test_fev1":      "FEV1/FVC 0.79 — normal",
-            "test_bnp":       "BNP 95 — normal, no heart failure",
-            "test_cxr_inf":   "Clear CXR — no consolidation",
-        },
+        "name":     "Williams-Beuren",
+        "symptom":  "toddler with heart disease, learning difficulties, overly friendly personality, and severe anxiety",
+        "expected": "Williams-Beuren syndrome",
     },
     {
-        "name":     "Pneumonia",
-        "symptom":  "difficulty breathing when active with fever, chills, productive yellow cough",
-        "expected": "Pneumonia",
-        "answers": {
-            "test_cxr_inf":   "RLL consolidation with air bronchograms",
-            "test_sputum":    "S. pneumoniae heavy growth, amoxicillin-sensitive",
-            "test_crp":       "CRP 168 mg/L, WBC 16.8 — bacterial infection",
-            "test_bnp":       "BNP 80 — normal",
-            "test_ddimer":    "D-dimer 1.1 — mildly elevated, inflammatory",
-        },
+        "name":     "Neurofibromatosis 1",
+        "symptom":  "young adult with multiple flat brown skin patches since childhood and soft nodular lumps developing under the skin",
+        "expected": "neurofibromatosis 1",
     },
     {
-        "name":     "Anemia",
-        "symptom":  "out of breath after walking a short distance, very pale and exhausted",
-        "expected": "Anemia",
-        "answers": {
-            "test_cbc":       "Hb 7.2, MCV 65, MCH 19 — severe microcytic anaemia",
-            "test_ferritin":  "Ferritin 2 ng/mL — critically low",
-            "test_fev1":      "FEV1/FVC 0.82 — normal",
-            "test_bnp":       "BNP 72 — normal",
-            "test_cxr_hyp":   "Normal CXR",
-        },
+        "name":     "Fragile X",
+        "symptom":  "teenage boy with moderate intellectual disability, large ears, poor eye contact, and hyperactive repetitive behaviors",
+        "expected": "fragile X syndrome",
     },
     {
-        "name":     "Interstitial Lung Disease",
-        "symptom":  "I get winded easily and have had a dry persistent cough for six months",
-        "expected": "Interstitial Lung Disease",
-        "answers": {
-            "test_hrct":      "Basal honeycombing, traction bronchiectasis, bilateral GGO",
-            "test_pft":       "Restrictive: TLC 62%, DLCO 44%",
-            "test_fev1":      "FEV1/FVC 0.88 — normal ratio, reduced volumes (restrictive)",
-            "test_cxr_hyp":   "Bilateral basal reticular shadowing — no hyperinflation",
-            "test_bronch":    "No reversibility — not asthma",
-        },
-    },
-
-    # ===== Palpitations =====
-    {
-        "name":     "Atrial Fibrillation",
-        "symptom":  "my heart is racing and beating irregularly — comes and goes",
-        "expected": "Atrial Fibrillation",
-        "answers": {
-            "test_ecg":       "Irregularly irregular, no P waves — AF confirmed",
-            "test_holter":    "8h AF in 24h Holter recording",
-            "test_echo_pal":  "LA 5.1 cm dilated, mild MR, EF 55%",
-            "test_gad7":      "GAD-7 4 — minimal anxiety",
-            "test_tsh":       "TSH 2.1 — normal",
-            "test_electro":   "Electrolytes normal",
-        },
+        "name":     "Tuberous Sclerosis 2",
+        "symptom":  "infant with seizures from three months of age, white depigmented skin patches, and progressive developmental delay",
+        "expected": "tuberous sclerosis 2",
     },
     {
-        "name":     "SVT",
-        "symptom":  "sudden rapid heartbeat that starts and stops abruptly",
-        "expected": "SVT",
-        "answers": {
-            "test_ecg":       "Regular narrow-complex tachycardia 178 bpm — SVT captured",
-            "test_holter":    "3 self-terminating SVT episodes; longest 4 min",
-            "test_electro":   "K+ 3.0 mmol/L — hypokalemia triggering SVT",
-            "test_echo_pal":  "Normal cardiac structure — no structural cause",
-            "test_gad7":      "GAD-7 5 — mild, not primary",
-            "test_tsh":       "TSH 1.8 — normal",
-        },
+        "name":     "CHARGE",
+        "symptom":  "newborn with a unilateral eye coloboma, profound sensorineural deafness, heart defect, and complete anosmia",
+        "expected": "CHARGE syndrome",
     },
     {
-        "name":     "Anxiety",
-        "symptom":  "heart pounding in my chest, very anxious all the time and cannot relax",
-        "expected": "Anxiety",
-        "answers": {
-            "test_gad7":      "GAD-7 19/21 — severe GAD",
-            "test_ecg":       "Sinus tachycardia 102 bpm, regular P waves — no arrhythmia",
-            "test_holter":    "Persistent sinus tachycardia; no arrhythmia; rate tracks anxiety",
-            "test_tsh":       "TSH 2.4 — normal",
-            "test_electro":   "Electrolytes normal",
-        },
+        "name":     "Huntington-Like 1",
+        "symptom":  "middle-aged adult with uncontrollable jerking arm movements, personality changes, and progressive memory loss",
+        "expected": "Huntington's disease-like 1",
     },
     {
-        "name":     "Hyperthyroidism",
-        "symptom":  "heart fluttering, rapid weight loss, feeling very hot all the time",
-        "expected": "Hyperthyroidism",
-        "answers": {
-            "test_tsh":       "TSH <0.01, fT4 38 — overt hyperthyroidism",
-            "test_ecg":       "Sinus tachycardia 118 bpm — no primary arrhythmia",
-            "test_holter":    "Persistent sinus tachycardia; no AF or SVT",
-            "test_gad7":      "GAD-7 7 — mild, likely secondary to hyperthyroid",
-            "test_electro":   "Electrolytes normal",
-        },
-    },
-
-    # ===== Vertigo =====
-    {
-        "name":     "BPPV",
-        "symptom":  "the room is spinning when I roll over in bed or tilt my head back",
-        "expected": "BPPV",
-        "answers": {
-            "test_dix":       "Positive right Dix-Hallpike: upbeat-torsional nystagmus, fatigues",
-            "test_roll":      "Positive supine roll — right horizontal-canal BPPV",
-            "test_hit":       "Negative HIT — no corrective saccade",
-            "test_vng":       "Positional nystagmus only — no spontaneous; BPPV pattern",
-            "test_mri":       "Normal MRI — no posterior fossa lesion",
-        },
+        "name":     "Cockayne",
+        "symptom":  "child with progressively small head, deteriorating hearing and vision, looks much older than their age",
+        "expected": "Cockayne syndrome",
     },
     {
-        "name":     "Vestibular Neuritis",
-        "symptom":  "I feel dizzy and lose my balance continuously — started suddenly after a cold",
-        "expected": "Vestibular Neuritis",
-        "answers": {
-            "test_hit":       "Positive HIT: corrective saccade to the right",
-            "test_vng":       "Unilateral caloric hypofunction right — canal paresis 68%",
-            "test_dix":       "Negative Dix-Hallpike — no positional nystagmus",
-            "test_mri":       "Normal MRI — no central lesion",
-            "test_audio":     "Hearing normal bilaterally",
-        },
+        "name":     "Rett Congenital",
+        "symptom":  "infant with severe hypotonia from birth, no motor development, cannot sit, and very simplified brain gyral pattern on MRI",
+        "expected": "congenital variant of Rett syndrome",
     },
     {
-        "name":     "Meniere's Disease",
-        "symptom":  "spinning with ringing in my left ear and fluctuating hearing loss",
-        "expected": "Meniere's Disease",
-        "answers": {
-            "test_audio":     "Low-freq SNHL (250–1000 Hz) left ear — classic Meniere's",
-            "test_vng":       "Reduced caloric response left; episodic low-freq nystagmus",
-            "test_tymp":      "Type A bilaterally — middle ear normal",
-            "test_dix":       "Negative Dix-Hallpike — no positional nystagmus",
-            "test_mri":       "Normal MRI; endolymphatic hydrops suspected clinically",
-        },
-    },
-    {
-        "name":     "Central Vertigo",
-        "symptom":  "spinning even when still, with double vision and difficulty walking",
-        "expected": "Central Vertigo",
-        "answers": {
-            "test_mri":       "1.9 cm posterior fossa mass, right cerebellum, perilesional oedema",
-            "test_hit":       "Negative HIT — intact VOR suggests central pathology",
-            "test_dix":       "Direction-changing nystagmus, non-fatiguing — central pattern",
-            "test_vng":       "Gaze-evoked nystagmus + ocular dysmetria — central signs",
-        },
+        "name":     "Mito DNA Depletion 6",
+        "symptom":  "infant with profound hypotonia, liver failure, lactic acidosis, and rapidly progressive neurological decline",
+        "expected": "mitochondrial DNA depletion syndrome 6",
     },
 ]
-
-# ------------------------------------------------------------------ #
-#  Helpers                                                            #
-# ------------------------------------------------------------------ #
-
-def _get_answer(scenario: dict, test_id: str) -> str:
-    return (
-        scenario.get("answers", {}).get(test_id)
-        or FALLBACK_ANSWERS.get(test_id)
-        or DEFAULT_ANSWER
-    )
-
-
-def _pause(seconds: float, label: str) -> None:
-    if seconds <= 0:
-        return
-    print(f"  ⏸  {label} — waiting {seconds:.0f}s …", flush=True)
-    time.sleep(seconds)
 
 
 # ------------------------------------------------------------------ #
 #  Session runner                                                     #
 # ------------------------------------------------------------------ #
 
-def run_scenario(orch: DiagnosticOrchestrator, scenario: dict, turn_delay: float) -> dict:
+def run_scenario(
+    orch: DiagnosticOrchestrator,
+    simulator: PatientSimulatorAgent,
+    scenario: dict,
+    turn_delay: float,
+    verbose: bool,
+) -> dict:
+    t0 = time.time()
+
     session_id, result = orch.start_session(scenario["symptom"])
 
-    symptom_match = result["symptom_match"]
-    q_count       = 0
+    symptom_match = result.get("symptom_match", {})
+    initial_diff  = result.get("initial_differential", [])
     question      = result.get("next_question")
-    questions_log = []
+    q_count       = 0
+    turns         = []
 
     while question:
+        q_text  = question.get("question", "")
         test_id = question.get("test_id", "")
-        answer  = _get_answer(scenario, test_id)
-        questions_log.append({
-            "q":      question.get("question", ""),
-            "test":   test_id,
-            "answer": answer,
-        })
 
-        if turn_delay > 0 and q_count > 0:
-            _pause(turn_delay, f"turn {q_count + 1}")
+        if turn_delay > 0:
+            time.sleep(turn_delay)
+
+        t_turn = time.time()
+        answer = simulator.answer(q_text, scenario["symptom"], scenario["name"])
+        sim_elapsed = round(time.time() - t_turn, 2)
+
+        if verbose:
+            print(f"\n  Q{q_count+1:02d} [{test_id}]: {q_text}")
+            print(f"       A: {answer}")
+
+        turns.append({
+            "turn":          q_count + 1,
+            "test_id":       test_id,
+            "question":      q_text,
+            "reasoning":     question.get("reasoning", ""),
+            "answer":        answer,
+            "sim_elapsed_s": sim_elapsed,
+        })
 
         result  = orch.submit_answer(session_id, answer)
         q_count += 1
+
+        diff_after = [
+            {"name": d["name"], "prob": round(d["probability"], 4)}
+            for d in result.get("updated_differential", [])[:5]
+        ]
+        turns[-1]["differential_after"] = diff_after
+
+        if verbose and diff_after:
+            top = diff_after[0]
+            print(f"       -> {top['name']} {top['prob']*100:.1f}%")
 
         if not result.get("should_continue") or result.get("final_diagnosis"):
             break
         question = result.get("next_question")
 
-    final = result.get("final_diagnosis") or {}
+    final   = result.get("final_diagnosis") or {}
+    elapsed = round(time.time() - t0, 1)
+
+    primary = final.get("primary_diagnosis", "")
+    correct = bool(primary) and (
+        scenario["expected"].lower() in primary.lower()
+        or primary.lower() in scenario["expected"].lower()
+    )
+
     return {
-        "scenario":        scenario["name"],
-        "expected":        scenario["expected"],
-        "symptom_matched": symptom_match.get("clinical_term", "?"),
-        "match_score":     symptom_match.get("score", 0.0),
-        "primary_dx":      final.get("primary_diagnosis", "—"),
-        "confidence":      final.get("confidence", 0.0),
-        "questions_asked": q_count,
-        "questions_log":   questions_log,
-        "top3":            final.get("differential", [])[:3],
-        "correct":         final.get("primary_diagnosis") == scenario["expected"],
+        "scenario":             scenario["name"],
+        "expected":             scenario["expected"],
+        "symptom_text":         scenario["symptom"],
+        "symptom_matched":      symptom_match.get("clinical_term", "?"),
+        "match_score":          round(symptom_match.get("score", 0.0), 3),
+        "initial_differential": [
+            {"name": d["name"], "prob": round(d["probability"], 4)}
+            for d in initial_diff[:5]
+        ],
+        "primary_dx":           primary,
+        "confidence":           round(final.get("confidence", 0.0), 4),
+        "confidence_warning":   final.get("confidence_warning", False),
+        "finalization_reason":  final.get("finalization_reason", "unknown"),
+        "questions_asked":      q_count,
+        "turns":                turns,
+        "top5_final": [
+            {"name": d["name"], "prob": round(d["probability"], 4)}
+            for d in final.get("differential", [])[:5]
+        ],
+        "correct":              correct,
+        "elapsed_s":            elapsed,
     }
 
 
 # ------------------------------------------------------------------ #
-#  Output                                                             #
+#  Output helpers                                                     #
 # ------------------------------------------------------------------ #
 
-BAR = "=" * 72
+BAR = "=" * 80
 
 def _print_detail(r: dict) -> None:
-    tick = "✓" if r["correct"] else "✗"
-    print(f"\n[{tick}] {r['scenario']}")
-    print(f"    Symptom cluster : {r['symptom_matched']}  (score {r['match_score']:.2f})")
-    print(f"    Expected        : {r['expected']}")
-    print(f"    Primary Dx      : {r['primary_dx']}  ({r['confidence'] * 100:.1f} %)")
-    print(f"    Questions asked : {r['questions_asked']}")
-    if r["top3"]:
-        print("    Top-3 differential:")
-        for d in r["top3"]:
-            bar_len = int(d["probability"] * 20)
-            bar     = "█" * bar_len + "░" * (20 - bar_len)
-            print(f"      {d['name']:32s} [{bar}] {d['probability'] * 100:.1f} %")
-    if r["questions_log"]:
-        print("    Q&A trace:")
-        for entry in r["questions_log"]:
-            print(f"      Q [{entry['test']:16s}] {entry['q']}")
-            print(f"        A: {entry['answer']}")
+    tick = "PASS" if r["correct"] else "FAIL"
+    print(f"\n{'─'*80}")
+    print(f"[{tick}]  {r['scenario']}")
+    print(f"  Symptom   : {r['symptom_text']}")
+    print(f"  HPO match : {r['symptom_matched']}  (score {r['match_score']:.3f})")
+    print(f"  Expected  : {r['expected']}")
+    print(f"  Diagnosed : {r['primary_dx']}  ({r['confidence'] * 100:.1f}%)")
+    print(f"  Reason    : {r['finalization_reason']}  | warning={r['confidence_warning']}")
+    print(f"  Questions : {r['questions_asked']}  | elapsed {r['elapsed_s']}s")
+
+    if r["initial_differential"]:
+        print("  Initial top-5:")
+        for d in r["initial_differential"]:
+            print(f"    {d['name']:44s} {d['prob']*100:5.1f}%")
+
+    if r["top5_final"]:
+        print("  Final top-5:")
+        for d in r["top5_final"]:
+            bar_len = int(d["prob"] * 28)
+            bar     = "█" * bar_len + "░" * (28 - bar_len)
+            print(f"    {d['name']:44s} [{bar}] {d['prob']*100:5.1f}%")
+
+    if r["turns"]:
+        print("  Q&A trace:")
+        for t in r["turns"]:
+            print(f"    T{t['turn']:02d}  [{t['test_id']}]  Q: {t['question'][:90]}")
+            print(f"          A: {t['answer'][:100]}")
+            if t.get("differential_after"):
+                top2 = t["differential_after"][:2]
+                summary = "  |  ".join(f"{d['name']} {d['prob']*100:.1f}%" for d in top2)
+                print(f"          -> {summary}")
 
 
-def print_report(results: list[dict], verbose: bool) -> None:
+def print_summary(results: list) -> None:
     print(f"\n{BAR}")
-    print("  ZIVAK — Multi-Disease Session Report")
+    print("  ZIVAK — Neo4j Rare-Disease Diagnostic Evaluation")
     print(BAR)
+    header = f"  {'Scenario':<22} {'Expected':<32} {'Diagnosed':<32} {'Conf':>5} {'Qs':>3}  OK?"
+    print(f"\n{header}")
+    print("  " + "─" * 78)
+    for r in results:
+        tick     = "PASS" if r["correct"] else "FAIL"
+        exp_s    = r["expected"][:30]
+        dx_s     = (r["primary_dx"] or "—")[:30]
+        warn_tag = " !" if r.get("confidence_warning") else "  "
+        print(
+            f"  {r['scenario']:<22} {exp_s:<32} {dx_s:<32}"
+            f" {r['confidence']*100:4.0f}%{warn_tag} {r['questions_asked']:>3}   {tick}"
+        )
 
-    if verbose:
-        for r in results:
-            _print_detail(r)
-    else:
-        header = f"  {'Scenario':<26} {'Expected':<26} {'Diagnosed':<26} {'Conf':>6}  {'Qs':>3}  OK?"
-        print(f"\n{header}")
-        print("  " + "-" * 70)
-        for r in results:
-            tick = "✓" if r["correct"] else "✗"
-            print(
-                f"  {r['scenario']:<26} {r['expected']:<26} {r['primary_dx']:<26}"
-                f" {r['confidence'] * 100:5.1f}%  {r['questions_asked']:>3}   {tick}"
-            )
-
-    correct = sum(1 for r in results if r["correct"])
-    print(f"\n{'-' * 72}")
-    print(f"  Result: {correct}/{len(results)} correct ({correct / len(results) * 100:.0f} %)")
+    correct  = sum(1 for r in results if r["correct"])
+    warn     = sum(1 for r in results if r.get("confidence_warning"))
+    errors   = sum(1 for r in results if "ERROR" in (r.get("primary_dx") or ""))
+    avg_qs   = sum(r["questions_asked"] for r in results) / max(len(results), 1)
+    print(f"\n  {'─'*78}")
+    print(f"  Accuracy : {correct}/{len(results)}  ({correct/max(len(results),1)*100:.0f}%)")
+    print(f"  Avg Qs   : {avg_qs:.1f}")
+    print(f"  Warnings : {warn}/{len(results)}  (low-confidence terminations)")
+    print(f"  Errors   : {errors}")
     print(f"{BAR}\n")
+
+
+def save_log(results: list, log_dir: Path, simulator_model: str) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path    = log_dir / f"run_{ts}.json"
+    correct = sum(1 for r in results if r["correct"])
+    avg_qs  = sum(r["questions_asked"] for r in results) / max(len(results), 1)
+    avg_conf = sum(r["confidence"] for r in results) / max(len(results), 1)
+
+    payload = {
+        "run_at":          ts,
+        "simulator_model": simulator_model,
+        "n_scenarios":     len(results),
+        "n_correct":       correct,
+        "accuracy_pct":    round(correct / max(len(results), 1) * 100, 1),
+        "avg_questions":   round(avg_qs, 2),
+        "avg_confidence":  round(avg_conf, 4),
+        "n_warnings":      sum(1 for r in results if r.get("confidence_warning")),
+        "results":         results,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 # ------------------------------------------------------------------ #
@@ -392,70 +367,93 @@ def print_report(results: list[dict], verbose: bool) -> None:
 # ------------------------------------------------------------------ #
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run ZIVAK multi-disease diagnostic scenarios")
-    p.add_argument(
-        "--filter", nargs="*", metavar="NAME",
-        help="Run only named scenario(s) — case-insensitive substring match",
-    )
-    p.add_argument(
-        "--delay", type=float, default=60.0, metavar="SECS",
-        help="Seconds to wait between scenarios to avoid Groq rate limits (default: 60)",
-    )
-    p.add_argument(
-        "--turn-delay", type=float, default=0.0, metavar="SECS",
-        help="Seconds to wait between Q&A turns within a scenario (default: 0)",
-    )
-    p.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Print full Q&A trace for every scenario",
-    )
+    p = argparse.ArgumentParser(description="Run ZIVAK rare-disease scenarios against live Neo4j")
+    p.add_argument("--filter", nargs="*", metavar="NAME",
+                   help="Run only named scenarios (case-insensitive substring match)")
+    p.add_argument("--delay", type=float, default=5.0, metavar="SECS",
+                   help="Pause between scenarios in seconds (default: 5)")
+    p.add_argument("--turn-delay", type=float, default=1.0, metavar="SECS",
+                   help="Pause between Q&A turns in seconds (default: 1)")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Print Q&A trace for every scenario")
+    p.add_argument("--no-log", action="store_true",
+                   help="Skip saving JSON log to reports/runs/")
+    p.add_argument("--simulator-model", default=None, metavar="MODEL",
+                   help="Groq model for patient simulator (default: llama-3.3-70b-versatile)")
     return p.parse_args()
 
 
 def main():
-    args    = parse_args()
-    filter_ = [f.lower() for f in args.filter] if args.filter else None
+    args = parse_args()
 
     scenarios = SCENARIOS
-    if filter_:
-        scenarios = [s for s in SCENARIOS if any(f in s["name"].lower() for f in filter_)]
+    if args.filter:
+        fl        = [f.lower() for f in args.filter]
+        scenarios = [s for s in SCENARIOS if any(f in s["name"].lower() for f in fl)]
         if not scenarios:
             print(f"No scenarios matched filter: {args.filter}", file=sys.stderr)
             sys.exit(1)
 
-    total_calls = len(scenarios) * 10 * 2  # rough upper bound: 10 turns × 2 LLM calls
-    print(f"Initialising mock clients (embedding model loads once) …")
-    print(f"Running {len(scenarios)} scenario(s)  |  inter-scenario delay: {args.delay:.0f}s  |  turn delay: {args.turn_delay:.0f}s")
-    print(f"Estimated LLM calls (upper bound): ~{total_calls}")
+    print("Initialising orchestrator (Neo4j + sentence-transformer) ...")
+    try:
+        qdrant, neo4j = get_clients(use_mock=False)
+    except Exception as exc:
+        print(f"ERROR: could not connect to Neo4j — {exc}", file=sys.stderr)
+        print("Check: docker compose up -d neo4j   and   .env NEO4J_PASSWORD", file=sys.stderr)
+        sys.exit(1)
 
-    qdrant = MockQdrantClient()
-    neo4j  = MockNeo4jClient()
-    orch   = DiagnosticOrchestrator(qdrant, neo4j)
+    orch      = DiagnosticOrchestrator(qdrant, neo4j)
+    simulator = PatientSimulatorAgent(model=args.simulator_model)
+
+    print(f"Patient simulator : groq / {simulator.model}")
+    print(f"Running {len(scenarios)} scenario(s)  |  delay={args.delay}s  |  turn-delay={args.turn_delay}s\n")
 
     results = []
     for i, scenario in enumerate(scenarios, 1):
         if i > 1 and args.delay > 0:
-            _pause(args.delay, f"rate-limit gap before scenario {i}")
+            time.sleep(args.delay)
 
-        print(f"\n[{i:02d}/{len(scenarios)}] {scenario['name']} …", end=" ", flush=True)
+        print(f"[{i:02d}/{len(scenarios)}] {scenario['name']} ...", end=" ", flush=True)
         try:
-            summary = run_scenario(orch, scenario, turn_delay=args.turn_delay)
-            results.append(summary)
-            tick = "✓" if summary["correct"] else "✗"
-            print(
-                f"{tick}  Dx={summary['primary_dx']} "
-                f"({summary['confidence'] * 100:.1f}%)  Qs={summary['questions_asked']}"
-            )
+            r = run_scenario(orch, simulator, scenario, args.turn_delay, args.verbose)
+            results.append(r)
+            tick = "PASS" if r["correct"] else "FAIL"
+            dx_s = (r["primary_dx"] or "—")[:40]
+            print(f"{tick}  dx={dx_s}  conf={r['confidence']*100:.0f}%  qs={r['questions_asked']}")
         except Exception as exc:
-            print(f"ERROR — {exc}")
+            import traceback
+            print("ERROR")
+            if args.verbose:
+                traceback.print_exc()
+            else:
+                print(f"  {exc}", file=sys.stderr)
             results.append({
-                "scenario": scenario["name"], "expected": scenario["expected"],
-                "symptom_matched": "?", "match_score": 0.0,
-                "primary_dx": f"ERROR: {exc}", "confidence": 0.0,
-                "questions_asked": 0, "questions_log": [], "top3": [], "correct": False,
+                "scenario":             scenario["name"],
+                "expected":             scenario["expected"],
+                "symptom_text":         scenario["symptom"],
+                "symptom_matched":      "?",
+                "match_score":          0.0,
+                "initial_differential": [],
+                "primary_dx":           f"ERROR: {exc}",
+                "confidence":           0.0,
+                "confidence_warning":   True,
+                "finalization_reason":  "error",
+                "questions_asked":      0,
+                "turns":                [],
+                "top5_final":           [],
+                "correct":              False,
+                "elapsed_s":            0.0,
             })
 
-    print_report(results, verbose=args.verbose)
+    if args.verbose:
+        for r in results:
+            _print_detail(r)
+
+    print_summary(results)
+
+    if not args.no_log:
+        log_path = save_log(results, Path(__file__).parent / "reports" / "runs", simulator.model)
+        print(f"Full log saved to: {log_path}\n")
 
 
 if __name__ == "__main__":

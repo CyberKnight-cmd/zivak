@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -65,15 +65,30 @@ class EvidenceEvaluatorAgent:
     def __init__(self, model: str = "openai/gpt-oss-120b", temperature: float = 0):
         self.llm = _build_llm(model, temperature, groq_reasoning="medium")
 
-    def evaluate(self, question: str, answer: str, edges: List[Dict]) -> Dict:
+    def evaluate(
+        self,
+        question: str,
+        answer: str,
+        edges: List[Dict],
+        test_threshold: Optional[str] = None,
+    ) -> Dict:
         """
         Evaluate evidence and return diagnostic implications.
+
+        Args:
+            question:        The diagnostic question that was asked.
+            answer:          The patient's free-text answer.
+            edges:           LR edges from Neo4j for this test.
+            test_threshold:  Optional per-test polarity reference, e.g.
+                             "FEV1/FVC < 0.70 = POSITIVE (obstruction), >= 0.70 = NEGATIVE"
+                             When provided, it is injected into Step 1 of the prompt to
+                             eliminate ambiguity on quantitative tests (C2 fix).
 
         Raises:
             RuntimeError: if all retry attempts fail.
                           Never silently returns empty evidence.
         """
-        prompt   = self._build_prompt(question, answer, edges)
+        prompt   = self._build_prompt(question, answer, edges, test_threshold)
         last_exc: Exception = None
 
         for attempt in range(MAX_RETRIES):
@@ -107,27 +122,48 @@ class EvidenceEvaluatorAgent:
           Any hallucinated or injected disease name is silently dropped.
         - Likelihood ratios are clamped to [0.001, 100].
           This prevents injected extreme values from collapsing the differential.
+        - Warns when both arrays are empty after cleaning — the turn contributes
+          zero information to the differential and the caller should be aware.
         """
         known = {e["disease"].lower().strip() for e in edges}
 
         def _clean(rules: List[Dict]) -> List[Dict]:
             cleaned = []
             for r in rules:
+                if not isinstance(r, dict):
+                    logger.warning("EvidenceEvaluator skipping malformed rule (expected dict, got %s): %r", type(r).__name__, r)
+                    continue
                 name = r.get("disease", "")
                 if name.lower().strip() not in known:
-                    logger.warning("EvidenceEvaluator dropped unknown disease %r from output", name)
+                    logger.warning(
+                        "EvidenceEvaluator dropped unknown disease %r from output", name
+                    )
                     continue
                 lr = float(r.get("likelihood_ratio", 1.0))
                 lr = max(0.001, min(lr, 100.0))
                 cleaned.append({"disease": name, "likelihood_ratio": lr})
             return cleaned
 
-        return {
+        cleaned = {
             "rules_in":  _clean(result.get("rules_in",  [])),
             "rules_out": _clean(result.get("rules_out", [])),
         }
 
-    def _build_prompt(self, question: str, answer: str, edges: List[Dict]) -> str:
+        if not cleaned["rules_in"] and not cleaned["rules_out"]:
+            logger.warning(
+                "EvidenceEvaluator: both rules_in and rules_out are empty after validation — "
+                "this Q&A turn will contribute zero information to the differential"
+            )
+
+        return cleaned
+
+    def _build_prompt(
+        self,
+        question: str,
+        answer: str,
+        edges: List[Dict],
+        test_threshold: Optional[str] = None,
+    ) -> str:
         # Pre-compute both polarity sets in Python so the LLM never has to invert LRs.
         # The edges encode positive-result LRs; a negative result inverts every LR
         # and flips every relationship (RULES_IN ↔ RULES_OUT).
@@ -149,11 +185,18 @@ class EvidenceEvaluatorAgent:
                 for e in lst
             )
 
+        # Per-test threshold injected into Step 1 to reduce polarity confusion on
+        # quantitative tests (C2 fix). E.g. "FEV1/FVC < 0.70 = POSITIVE, >= 0.70 = NEGATIVE"
+        threshold_line = (
+            f"\n            Reference threshold: {test_threshold}"
+            if test_threshold else ""
+        )
+
         return f"""You are ZIVAK's Evidence Evaluator Agent.
 
 Your ONLY job:
   Step 1 — Decide if the test result is POSITIVE (abnormal / confirms pathology)
-            or NEGATIVE (normal / no pathology found).
+            or NEGATIVE (normal / no pathology found).{threshold_line}
   Step 2 — Copy the matching pre-computed evidence set into your JSON output.
             Do NOT invent or modify any values.
 

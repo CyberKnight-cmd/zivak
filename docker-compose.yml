@@ -1,0 +1,21 @@
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: zivak-neo4j
+    ports:
+      - "7474:7474"   # Neo4j browser  →  http://localhost:7474
+      - "7687:7687"   # Bolt (driver)  →  bolt://localhost:7687
+    environment:
+      NEO4J_AUTH: neo4j/zivak_password
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p zivak_password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  neo4j_data:
