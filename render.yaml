@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: zivak-api
+    runtime: python
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY_SELECTOR
+        sync: false
+      - key: GEMINI_API_KEY_EVALUATOR
+        sync: false
+      - key: API_KEY
+        sync: false
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USER
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false
+      - key: USE_MOCK
+        value: false
+      - key: PYTHON_VERSION
+        value: "3.13"

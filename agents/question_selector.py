@@ -1,6 +1,6 @@
 """
 Question Selector Agent - Uses LLM to pick best diagnostic question
-Requires: GROQ_API_KEY in .env
+Requires: GEMINI_API_KEY_SELECTOR in .env
 """
 
 import json
@@ -20,24 +20,15 @@ MAX_RETRIES  = 3
 BASE_BACKOFF = 1.0  # seconds — doubles each attempt: 1s, 2s, 4s
 
 
-def _build_llm(groq_model: str, groq_temperature: float, groq_reasoning: str):
-    """Return a ChatGroq or local OpenAI-compatible LLM based on USE_LOCAL_LLM env var."""
-    if os.getenv("USE_LOCAL_LLM", "").lower() == "true":
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=os.getenv("LOCAL_MODEL", "qwen2.5:14b"),
-            temperature=groq_temperature,
-            max_tokens=512,
-            base_url=os.getenv("LOCAL_LLM_URL", "http://localhost:11434/v1"),
-            api_key="ollama",
-        )
-    from langchain_groq import ChatGroq
-    return ChatGroq(
-        model=groq_model,
-        temperature=groq_temperature,
-        max_tokens=512,
-        reasoning_effort=groq_reasoning,
-        api_key=os.getenv("GROQ_API_KEY"),
+def _build_llm(model: str, temperature: float):
+    """Return a ChatGoogleGenerativeAI LLM for the Question Selector."""
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    return ChatGoogleGenerativeAI(
+        model=model,
+        temperature=temperature,
+        max_output_tokens=2048,
+        thinking_budget=0,
+        google_api_key=os.getenv("GEMINI_API_KEY_SELECTOR"),
     )
 
 
@@ -62,8 +53,8 @@ class QuestionSelectorAgent:
     because a silently wrong question is worse than a visible error.
     """
 
-    def __init__(self, model: str = "openai/gpt-oss-120b", temperature: float = 1):
-        self.llm = _build_llm(model, temperature, groq_reasoning="medium")
+    def __init__(self, model: str = "gemini-2.5-flash", temperature: float = 1):
+        self.llm = _build_llm(model, temperature)
 
     def select_question(
         self,
@@ -140,57 +131,35 @@ class QuestionSelectorAgent:
             for i, d in enumerate(differential[:5])
         )
 
-        # --- Tests block ---
-        # When LR data is available, show numeric LRs so the LLM can distinguish
-        # test_hrct (ILD LR≈20.0) from test_cxr_hyp (COPD LR≈4.2).
-        # Only RULES_IN LRs are shown — they are the most actionable for selection.
-        def _fmt_test(t: Dict) -> str:
-            if test_lr_map:
-                edges = test_lr_map.get(t["id"], [])
-                lr_parts = [
-                    f"{e['disease']} LR≈{e['lr']}"
-                    for e in edges
-                    if e["relationship"] == "RULES_IN"
-                ]
-                # Fallback to disease list if no RULES_IN edges found for this test
-                if lr_parts:
-                    return f"- {t['name']} (ID: {t['id']}): {', '.join(lr_parts)}"
-            return f"- {t['name']} (ID: {t['id']}): relevant for {', '.join(t['diseases'])}"
-
-        has_lr = bool(test_lr_map)
-        tests_header = (
-            "Available tests (LR values show how strongly a positive result shifts probability):"
-            if has_lr else
-            "Available tests:"
-        )
-        tests_text = "\n".join(_fmt_test(t) for t in available_tests)
-
-        lr_criterion = (
-            "2. Prefer tests with higher LR values — they produce larger probability shifts"
-            if has_lr else
-            "2. Has strong likelihood ratios (changes probability significantly)"
+        # Tests have already been pre-ranked by Expected Information Gain in Python.
+        # The LLM's job here is purely: pick the most clinically practical one and
+        # phrase the question naturally for a patient.
+        tests_text = "\n".join(
+            f"- {t['name']} (ID: {t['id']})"
+            for t in available_tests
         )
 
         return f"""You are ZIVAK's Question Selector Agent.
 
-Your task: Pick the SINGLE diagnostic test that will most reduce uncertainty in the differential diagnosis.
+These tests have been pre-ranked by diagnostic information value (highest first).
+Your task: pick the most clinically practical one and phrase it as a clear, natural question for a patient.
 
 {context_block}Current differential diagnosis:
 {diff_text}
 
-{tests_header}
+Pre-ranked candidate tests (ask the most practical one from this list):
 {tests_text}
 
 Selection criteria:
-1. Discriminates between top candidates (ideally tests that differ between #1 and #2)
-{lr_criterion}
-3. Is clinically practical to obtain
+1. Prefer tests higher in the list (they discriminate better between the leading diagnoses)
+2. Pick the least invasive / most accessible option when information value is similar
+3. Phrase the question in plain language the patient will understand
 
 Output ONLY valid JSON with this exact structure:
 {{
-  "question": "What is the result of [test name]?",
-  "test_id": "test_xxx",
-  "reasoning": "Brief explanation of why this test is most informative"
+  "question": "Natural language question to ask the patient",
+  "test_id": "HP:xxxxxxx",
+  "reasoning": "One sentence: why this test, why this phrasing"
 }}
 
 Do NOT include any text outside the JSON object.

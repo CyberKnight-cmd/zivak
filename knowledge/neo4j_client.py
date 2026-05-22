@@ -47,6 +47,10 @@ class Neo4jClient:
         password = os.getenv("NEO4J_PASSWORD")
         if not password:
             raise ValueError("NEO4J_PASSWORD is required — set it in .env")
+        # neo4j+s:// verifies the server certificate which fails on Windows when
+        # the Aura CA chain isn't in the system store. Switching to neo4j+ssc://
+        # keeps the encrypted connection but skips cert verification.
+        uri = uri.replace("neo4j+s://", "neo4j+ssc://").replace("bolt+s://", "bolt+ssc://")
         self._driver = neo4j.GraphDatabase.driver(uri, auth=(user, password))
 
     # ------------------------------------------------------------------ #
@@ -106,16 +110,22 @@ class Neo4jClient:
         # symptom that has no direct disease links still seeds the differential.
         present_ids = {d["disease_id"] for d in results}
 
+        # Only append rare diseases that actually present with the given symptom(s).
+        # A rare disease with no PRESENTS_WITH edge to the complaint is irrelevant
+        # and dilutes the differential — exclude it.
         with self._driver.session() as session:
             rare_rows = session.run(
                 """
-                MATCH (d:Disease)
-                WHERE d.prevalence < $threshold AND NOT d.id IN $present_ids
-                RETURN d.id AS disease_id, d.name AS name, d.prevalence AS prevalence
+                MATCH (d:Disease)-[:PRESENTS_WITH]->(s:Symptom)
+                WHERE d.prevalence < $threshold
+                  AND NOT d.id IN $present_ids
+                  AND s.id IN $hp_ids
+                RETURN DISTINCT d.id AS disease_id, d.name AS name, d.prevalence AS prevalence
                 LIMIT $limit
                 """,
                 threshold=_RARE_DISEASE_PREVALENCE_THRESHOLD,
                 present_ids=list(present_ids),
+                hp_ids=hp_ids,
                 limit=_RARE_DISEASE_LIMIT,
             ).data()
 
@@ -132,7 +142,7 @@ class Neo4jClient:
 
         return results
 
-    def get_available_tests(self, disease_ids: list[str]) -> list[dict]:
+    def get_available_tests(self, disease_ids: list[str], limit: int = 40) -> list[dict]:
         """
         Return HP symptom terms connected to the given diseases that are
         suitable as diagnostic questions.
@@ -140,6 +150,10 @@ class Neo4jClient:
         Filters applied in Cypher:
           category IN ['symptom', 'lab_finding']  — skip structural 'sign' terms
           sensitivity >= 0.10                     — skip rare co-occurrences
+
+        Ordered by discriminativeness: symptoms shared by the most candidate
+        diseases come first (highest EIG potential), tie-broken by average
+        sensitivity. The caller caps further via the EIG ranker.
 
         Returns [{id, name, diseases}] where id is the HP ID that will become
         question["test_id"] when selected by QuestionSelectorAgent.
@@ -156,13 +170,16 @@ class Neo4jClient:
                 WHERE d.id IN $disease_ids
                   AND s.category IN ['symptom', 'lab_finding']
                   AND r.sensitivity >= $threshold
-                RETURN DISTINCT s.id   AS id,
-                                s.name AS name,
-                                collect(DISTINCT d.id) AS diseases
-                ORDER BY s.id
+                WITH s, collect(DISTINCT d.id) AS diseases, AVG(r.sensitivity) AS avg_se
+                RETURN s.id   AS id,
+                       s.name AS name,
+                       diseases
+                ORDER BY size(diseases) DESC, avg_se DESC
+                LIMIT $limit
                 """,
                 disease_ids=disease_ids,
                 threshold=_SENSITIVITY_THRESHOLD,
+                limit=limit,
             ).data()
 
         return [
@@ -170,7 +187,7 @@ class Neo4jClient:
             for r in rows
         ]
 
-    def get_test_edges(self, hp_id: str) -> list[dict]:
+    def get_test_edges(self, hp_id: str, disease_ids: list[str] | None = None) -> list[dict]:
         """
         Return LR edges for an HP symptom term.
 
@@ -181,27 +198,37 @@ class Neo4jClient:
           relationship: "RULES_IN"  (LR+) or "RULES_OUT" (LR-)
           lr:           likelihood_ratio float
 
+        disease_ids: when supplied, only edges pointing to those diseases are
+        returned, keeping the EvidenceEvaluator prompt scoped to the active
+        differential. Pass None to get all edges (backward-compatible).
+
         Two separate queries because UNION in Cypher requires identical column types
         and it is cleaner to combine in Python.
         """
         if not hp_id:
             return []
 
+        filter_clause = "AND d.id IN $disease_ids" if disease_ids else ""
+
         with self._driver.session() as session:
             in_rows = session.run(
-                """
-                MATCH (s:Symptom {id: $hp_id})-[r:RULES_IN]->(d:Disease)
+                f"""
+                MATCH (s:Symptom {{id: $hp_id}})-[r:RULES_IN]->(d:Disease)
+                WHERE 1=1 {filter_clause}
                 RETURN d.name AS disease, r.likelihood_ratio AS lr
                 """,
                 hp_id=hp_id,
+                disease_ids=disease_ids or [],
             ).data()
 
             out_rows = session.run(
-                """
-                MATCH (s:Symptom {id: $hp_id})-[r:RULES_OUT]->(d:Disease)
+                f"""
+                MATCH (s:Symptom {{id: $hp_id}})-[r:RULES_OUT]->(d:Disease)
+                WHERE 1=1 {filter_clause}
                 RETURN d.name AS disease, r.likelihood_ratio AS lr
                 """,
                 hp_id=hp_id,
+                disease_ids=disease_ids or [],
             ).data()
 
         return [

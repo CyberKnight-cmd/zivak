@@ -15,12 +15,7 @@ Swap mock clients for real ones by setting USE_MOCK=false in .env.
 
 import logging
 import os
-import subprocess
-import sys
-import time
 from contextlib import asynccontextmanager
-from urllib.request import urlopen
-from urllib.error import URLError
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Security, status
@@ -34,46 +29,6 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
-#  Ollama lifecycle — kill stale process, start fresh, wait for ready #
-# ------------------------------------------------------------------ #
-
-def _kill_ollama() -> None:
-    """Terminate any running Ollama process."""
-    try:
-        if sys.platform == "win32":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/IM", "ollama.exe"],
-                capture_output=True, timeout=10,
-            )
-        else:
-            subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True, timeout=10)
-        time.sleep(1)  # let the port free up
-    except Exception:
-        pass
-
-
-def _start_ollama() -> subprocess.Popen:
-    """Start `ollama serve` and wait up to 30 s for it to answer HTTP."""
-    env = {**os.environ, "OLLAMA_NUM_PARALLEL": "1"}  # one inference slot → no VRAM contention
-    proc = subprocess.Popen(
-        ["ollama", "serve"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
-    ollama_url = os.getenv("LOCAL_LLM_URL", "http://localhost:11434/v1").rsplit("/v1", 1)[0]
-    for _ in range(30):
-        try:
-            urlopen(ollama_url, timeout=1)
-            logger.info("Ollama ready at %s", ollama_url)
-            return proc
-        except (URLError, OSError):
-            time.sleep(1)
-    proc.kill()
-    raise RuntimeError("Ollama failed to start within 30 s")
-
-
-# ------------------------------------------------------------------ #
 #  App lifecycle — build orchestrator once at startup                  #
 # ------------------------------------------------------------------ #
 
@@ -81,18 +36,11 @@ from orchestrator.mock_clients import get_clients
 from orchestrator.orchestrator import DiagnosticOrchestrator, SessionNotFoundError
 
 _orchestrator: DiagnosticOrchestrator | None = None
-_ollama_proc:  subprocess.Popen | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _ollama_proc
-
-    use_local_llm = os.getenv("USE_LOCAL_LLM", "").lower() == "true"
-    if use_local_llm:
-        logger.info("USE_LOCAL_LLM=true — restarting Ollama for clean GPU state")
-        _kill_ollama()
-        _ollama_proc = _start_ollama()
+    global _orchestrator
 
     use_mock = os.getenv("USE_MOCK", "true").lower() != "false"
     qdrant, neo4j = get_clients(use_mock=use_mock)
@@ -101,9 +49,6 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("Shutdown")
-    if _ollama_proc is not None:
-        _ollama_proc.terminate()
-        _ollama_proc = None
 
 
 app = FastAPI(title="ZIVAK Diagnostic API", version="0.1.0", lifespan=lifespan)

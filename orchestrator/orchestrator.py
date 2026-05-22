@@ -36,6 +36,7 @@ from agents.evidence_evaluator import EvidenceEvaluatorAgent
 from agents.question_selector import QuestionSelectorAgent
 from engines.confidence_judge import ConfidenceJudge
 from engines.differential import DifferentialEngine
+from engines.information_gain import rank_by_eig
 
 logger = logging.getLogger(__name__)
 
@@ -160,19 +161,23 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             "confidence_warning":  _top_confidence_warning(state),
         }
 
-    # --- Build test pool from ALL diseases (M1 fix: was top-5 only) ---
-    # Use disease_id (DOID) when available (real Neo4j client); fall back to name
-    # for backward compat with MockNeo4jClient which keys by disease name.
-    all_disease_ids = [
-        d.get("disease_id", d["name"]) for d in state["differential"]
-    ]
+    # --- Active differential: P >= 3% OR at least top-8, whichever is larger ---
+    # The threshold prunes implausible diseases as the session converges (~15 → ~3).
+    # The top-8 floor ensures a rare correct diagnosis starting at the 2% prior
+    # floor is never accidentally evicted before it has a chance to be confirmed.
+    _ACTIVE_THRESHOLD = 0.03
+    _ACTIVE_MIN_COUNT = 8
+    above  = [d for d in state["differential"] if d["probability"] >= _ACTIVE_THRESHOLD]
+    active = above if len(above) >= _ACTIVE_MIN_COUNT else state["differential"][:_ACTIVE_MIN_COUNT]
+    active_ids = [d.get("disease_id", d["name"]) for d in active]
+
     asked_ids       = {q["test_id"] for q in state["questions_asked"]}
     available_tests = [
-        t for t in neo4j.get_available_tests(all_disease_ids)
+        t for t in neo4j.get_available_tests(active_ids)
         if t["id"] not in asked_ids
     ]
     if not available_tests:
-        logger.warning("question: no tests remain for %s", all_disease_ids)
+        logger.warning("question: no tests remain for active diseases %s", active_ids)
         return {
             "should_finalize":     True,
             "judge_details":       {"reason": "No tests available"},
@@ -180,25 +185,45 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             "confidence_warning":  _top_confidence_warning(state),
         }
 
-    # --- Build selector context (N1 + N4 fixes) ---
-    test_lr_map = {t["id"]: neo4j.get_test_edges(t["id"]) for t in available_tests}
-    symptom     = state["symptom_match"].get("clinical_term") or None
-    qa_history  = (
+    # --- EIG pre-ranking: fetch edges for all candidates, rank, take top 5 ---
+    # Neo4j returns at most 40 tests (bounded by get_available_tests limit).
+    # Edges are scoped to active diseases to keep each query small.
+    # rank_by_eig() runs in microseconds (pure math, no I/O).
+    test_lr_map = {
+        t["id"]: neo4j.get_test_edges(t["id"], active_ids)
+        for t in available_tests
+    }
+    top_ids   = rank_by_eig(state["differential"], test_lr_map, top_n=5)
+    top_tests = [t for t in available_tests if t["id"] in top_ids]
+    top_lr    = {tid: test_lr_map[tid] for tid in top_ids if tid in test_lr_map}
+
+    # Fall back to first available test if EIG returned nothing usable.
+    if not top_tests:
+        top_tests = available_tests[:1]
+        top_lr    = {top_tests[0]["id"]: test_lr_map.get(top_tests[0]["id"], [])}
+
+    logger.info(
+        "question: %d candidates → top-%d by EIG: %s",
+        len(available_tests), len(top_tests), [t["id"] for t in top_tests],
+    )
+
+    symptom    = state["symptom_match"].get("clinical_term") or None
+    qa_history = (
         [{"question": q["question"]} for q in state["questions_asked"]]
         or None
     )
 
-    # --- Select question ---
+    # --- Select question — LLM sees only the 5 EIG-ranked finalists (~400 tokens) ---
     question  = selector.select_question(
         state["differential"],
-        available_tests,
-        test_lr_map=test_lr_map,
+        top_tests,
+        test_lr_map=top_lr,
         symptom=symptom,
         qa_history=qa_history,
     )
-    valid_ids = {t["id"] for t in available_tests}
+    valid_ids = {t["id"] for t in top_tests}
     if question.get("test_id") not in valid_ids:
-        fallback = available_tests[0]
+        fallback = top_tests[0]
         logger.warning(
             "question: selector returned out-of-scope test_id %r — falling back to %s",
             question.get("test_id"), fallback["id"],
@@ -240,7 +265,10 @@ def answer_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
         if state.get("differential") else None
     )
 
-    edges = neo4j.get_test_edges(question["test_id"])
+    above_ans  = [d for d in state["differential"] if d["probability"] >= 0.03]
+    active_ans = above_ans if len(above_ans) >= 8 else state["differential"][:8]
+    active_ids = [d.get("disease_id", d["name"]) for d in active_ans] or None
+    edges = neo4j.get_test_edges(question["test_id"], active_ids)
 
     # Wire test_threshold if the neo4j client provides one (C2 readiness).
     get_threshold  = getattr(neo4j, "get_test_threshold", None)

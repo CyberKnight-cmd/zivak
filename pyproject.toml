@@ -7,10 +7,10 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
-    "langchain-groq>=0.2.0",
-    "langchain-openai>=0.1.0",
+    "langchain-google-genai>=2.0.0",
     "langgraph>=0.2.0",
     "python-dotenv>=1.0.0",
+    "torch>=2.6.0",
     "sentence-transformers>=3.0.0",
     "numpy>=1.26.0",
     "pytest>=9.0.3",

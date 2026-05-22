@@ -385,4 +385,6 @@ def get_clients(use_mock: bool = True):
     else:
         from knowledge.qdrant_client import QdrantClient
         from knowledge.neo4j_client import Neo4jClient
-        return QdrantClient(), Neo4jClient()
+        neo4j  = Neo4jClient()
+        qdrant = QdrantClient(neo4j_client=neo4j)
+        return qdrant, neo4j
