@@ -3,6 +3,8 @@
 
 > **"A doctor that never guesses."**
 
+![ZIVAK Banner](Banner.png)
+
 ZIVAK is an agentic AI system that performs structured Bayesian differential diagnosis. Given a patient's complaint in plain language, it asks the single most informative diagnostic question each turn, updates its probability distribution over candidate diseases using likelihood ratios from a medical knowledge graph, and converges on a grounded, auditable final diagnosis.
 
 Unlike symptom checkers that match keywords or LLMs that hallucinate clinical facts, every probability shift in ZIVAK is **traceable to a graph edge** in a Neo4j knowledge base built from 12,127 diseases, 19,389 HPO symptom terms, and 99,057 clinically derived relationships.
