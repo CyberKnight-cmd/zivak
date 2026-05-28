@@ -94,6 +94,31 @@ class MockQdrantClient:
         _, clinical_term, symptom_id = self._CORPUS[best_idx]
         return {"clinical_term": clinical_term, "symptom_id": symptom_id, "score": best_score}
 
+    def search(self, user_text: str) -> Dict:
+        """New interface matching knowledge.qdrant_client.QdrantClient.search()."""
+        query      = self._model.encode([user_text], normalize_embeddings=True)[0]
+        scores     = self._embeddings @ query
+        best_idx   = int(np.argmax(scores))
+        best_score = float(scores[best_idx])
+
+        if best_score < _SIMILARITY_THRESHOLD:
+            return {
+                "clinical_term": None,
+                "symptom_id":    None,
+                "symptom_ids":   [],
+                "score":         0.0,
+                "matched":       False,
+            }
+
+        _, clinical_term, symptom_id = self._CORPUS[best_idx]
+        return {
+            "clinical_term": clinical_term,
+            "symptom_id":    symptom_id,
+            "symptom_ids":   [symptom_id],
+            "score":         best_score,
+            "matched":       True,
+        }
+
 
 class MockNeo4jClient:
     """
@@ -361,9 +386,17 @@ class MockNeo4jClient:
         ],
     }
 
-    def get_initial_differential(self, symptom_id: str) -> List[Dict]:
+    def get_initial_differential(self, symptom_ids) -> List[Dict]:
         import copy
-        return copy.deepcopy(self._DISEASES.get(symptom_id, []))
+        if isinstance(symptom_ids, str):
+            symptom_ids = [symptom_ids]
+        seen, result = set(), []
+        for sid in symptom_ids:
+            for d in self._DISEASES.get(sid, []):
+                if d["name"] not in seen:
+                    seen.add(d["name"])
+                    result.append(copy.deepcopy(d))
+        return result
 
     def get_available_tests(self, disease_names: List[str]) -> List[Dict]:
         tests = []
@@ -375,7 +408,7 @@ class MockNeo4jClient:
                     seen_ids.add(test["id"])
         return tests
 
-    def get_test_edges(self, test_id: str) -> List[Dict]:
+    def get_test_edges(self, test_id: str, active_disease_ids=None) -> List[Dict]:
         return self._LIKELIHOOD_RATIOS.get(test_id, [])
 
 
@@ -386,5 +419,5 @@ def get_clients(use_mock: bool = True):
         from knowledge.qdrant_client import QdrantClient
         from knowledge.neo4j_client import Neo4jClient
         neo4j  = Neo4jClient()
-        qdrant = QdrantClient(neo4j_client=neo4j)
+        qdrant = QdrantClient()
         return qdrant, neo4j

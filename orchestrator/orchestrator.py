@@ -65,8 +65,9 @@ class DiagnosticState(TypedDict):
     final_diagnosis:     Optional[Dict]
     previous_top_prob:   Optional[float]   # top prob snapshot before the last answer
     pending_question:    Optional[Dict]    # question_node → answer_node handoff (C1 fix)
-    finalization_reason: Optional[str]    # "confidence_gate" | "no_tests" | "max_questions"
+    finalization_reason: Optional[str]    # "confidence_gate" | "no_tests" | "max_questions" | "no_symptom_match"
     confidence_warning:  bool             # top_probability < threshold at termination (M4)
+    error_message:       Optional[str]    # set when finalization_reason == "no_symptom_match"
 
 
 # ------------------------------------------------------------------ #
@@ -101,10 +102,25 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     qdrant = cfg["qdrant"]
     neo4j  = cfg["neo4j"]
 
-    symptom_match = qdrant.search_symptom(state["user_input"])
+    symptom_match = qdrant.search(state["user_input"])
+
+    if not symptom_match["matched"]:
+        return {
+            "symptom_match":       symptom_match,
+            "final_diagnosis":     None,
+            "should_finalize":     True,
+            "confidence_warning":  True,
+            "finalization_reason": "no_symptom_match",
+            "error_message": (
+                "I couldn't identify any medical symptoms in your description. "
+                "Please describe your symptoms more specifically — for example, "
+                "'chest pain', 'shortness of breath', or 'severe headache'."
+            ),
+        }
+
     # Accept both single symptom_id (mock) and symptom_ids list (real Qdrant client).
-    symptom_ids   = symptom_match.get("symptom_ids") or [symptom_match["symptom_id"]]
-    diseases      = neo4j.get_initial_differential(symptom_ids)
+    symptom_ids = symptom_match.get("symptom_ids") or [symptom_match["symptom_id"]]
+    diseases    = neo4j.get_initial_differential(symptom_ids)
 
     engine       = DifferentialEngine()
     differential = engine.initialize(diseases)
@@ -415,6 +431,7 @@ class DiagnosticOrchestrator:
             "pending_question":    None,
             "finalization_reason": None,
             "confidence_warning":  False,
+            "error_message":       None,
         }
 
         snapshot = self._graph.invoke(initial, config)

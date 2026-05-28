@@ -13,15 +13,13 @@ Sensitivity (Se)
     Derived from the HPOA ``frequency_raw`` field.
 
 Background rate (Bg)
-    = P(symptom present | disease absent)
-    Approximated as:
-        Bg[hp_id] = (number of distinct diseases annotated with hp_id)
-                    ─────────────────────────────────────────────────
-                    (total distinct diseases in the annotation set)
-    This is a population-level estimate of how "specific" a symptom is.
-    A symptom seen in 800/8000 diseases has Bg = 0.10 — it is a weak
-    discriminator.  A symptom seen in 3/8000 has Bg = 0.000375 — it is
-    highly specific.
+    = P(symptom present in the general population)
+    Computed as:
+        Bg[hp_id] = Σ (prevalence_i × sensitivity_i)
+                    for all diseases i annotated with hp_id
+    This is a prevalence-weighted population estimate. A symptom that appears
+    in a common disease (high prevalence) contributes more to Bg than the same
+    symptom appearing only in ultra-rare diseases.
 
 LR+ = Se / Bg
 LR− = (1 − Se) / (1 − Bg)
