@@ -110,6 +110,22 @@ def start_session(body: StartRequest):
     """
     try:
         session_id, result = _orchestrator.start_session(body.symptom)
+
+        symptom_match = result.get("symptom_match", {})
+        if not symptom_match.get("matched", True):
+            return {
+                "session_id":          session_id,
+                "finalization_reason": "no_symptom_match",
+                "error_message": (
+                    "I couldn't identify any medical symptoms in your description. "
+                    "Please describe your symptoms more specifically — for example, "
+                    "'chest pain', 'shortness of breath', or 'severe headache'."
+                ),
+                "symptom_match":  {"matched": False},
+                "should_continue": False,
+                "final_diagnosis": None,
+            }
+
         return result
     except RuntimeError as e:
         logger.error("start_session failed: %s", e)

@@ -145,14 +145,15 @@ def parse_hpoa(hpoa_path: Path) -> list[dict[str, Any]]:
     df["frequency"] = df["frequency"].fillna("").str.strip()
 
     # ── Step 6: build output records ─────────────────────────────────────────
-    records: list[dict[str, Any]] = [
-        {
-            "disease_id":    row["database_id"].strip(),
-            "hpo_id":        row["hpo_id"].strip(),
-            "frequency_raw": row["frequency"],
-        }
-        for _, row in df.iterrows()
-    ]
+    records: list[dict[str, Any]] = (
+        df[["database_id", "hpo_id", "frequency"]]
+        .rename(columns={"database_id": "disease_id", "hpo_id": "hpo_id", "frequency": "frequency_raw"})
+        .assign(
+            disease_id=df["database_id"].str.strip(),
+            hpo_id=df["hpo_id"].str.strip(),
+        )
+        .to_dict("records")
+    )
 
     n_diseases  = len({r["disease_id"] for r in records})
     n_omim      = len({r["disease_id"] for r in records if r["disease_id"].startswith("OMIM:")})

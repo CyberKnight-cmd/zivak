@@ -15,8 +15,9 @@ dependencies = [
     "numpy>=1.26.0",
     "pytest>=9.0.3",
     "httpx>=0.27.0",
-    # Neo4j runtime client + pipeline deps
+    # Neo4j and QDrant runtime client + pipeline deps
     "neo4j>=5.28.1",
+    "qdrant-client>=1.9.0",
     "pandas>=2.2.3",
     "tqdm>=4.67.1",
     "pronto>=2.7.3",
@@ -24,3 +25,11 @@ dependencies = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true

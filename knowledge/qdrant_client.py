@@ -1,238 +1,170 @@
 """
 knowledge/qdrant_client.py
-──────────────────────────────────────────────────────────────────────────────
-In-process semantic symptom search using sentence-transformers.
-No external vector DB required.
+Semantic symptom search backed by a real Qdrant vector database.
 
-Corpus loading (priority order):
-  1. Neo4j  — queries all Symptom nodes at startup
-  2. data/processed/symptom_index.json  — fallback if Neo4j is unavailable
+Model: NeuML/pubmedbert-base-embeddings (768d, PubMed fine-tuned)
+Collection: "symptoms"  (populated by scripts/5_populate_qdrant.py)
 
-Multi-symptom support: compound complaints like "chest pain and breathlessness"
-are split into individual terms, searched separately, and deduplicated by HP ID.
-Returns all matched HP IDs in symptom_ids so seed_node can union multiple
-symptom clusters when building the initial differential.
-
-search_symptom() always returns:
-  {
-    "clinical_term": str,       best-matching HPO name
-    "symptom_id":    str,       primary HP ID  (highest-score match)
-    "symptom_ids":   list[str], all matched HP IDs (1+ for compound inputs)
-    "score":         float,     cosine similarity of best match [0, 1]
-  }
+search() return contract:
+  Match (score >= threshold):
+    {"clinical_term": "Exertional dyspnea", "symptom_id": "HP:0002875",
+     "symptom_ids": ["HP:0002875", ...], "score": 0.87, "matched": True}
+  No match (all scores below threshold or empty):
+    {"clinical_term": None, "symptom_id": None,
+     "symptom_ids": [], "score": 0.0, "matched": False}
 """
 
 from __future__ import annotations
 
-import json
-import logging
+import os
 import re
-from pathlib import Path
-from typing import TYPE_CHECKING
+import threading
 
-import numpy as np
-from sentence_transformers import SentenceTransformer
+MATCH_THRESHOLD = float(os.getenv("QDRANT_MATCH_THRESHOLD", "0.60"))
 
-if TYPE_CHECKING:
-    from knowledge.neo4j_client import Neo4jClient
-
-logger = logging.getLogger(__name__)
-
-_MODEL_NAME           = "all-MiniLM-L6-v2"
-_SIMILARITY_THRESHOLD = 0.30
-_MAX_SYMPTOMS         = 5       # cap on distinct HP IDs returned per query
-_MIN_TERM_LEN         = 4       # ignore split fragments shorter than this
-
-_SYMPTOM_INDEX_JSON = (
-    Path(__file__).resolve().parent.parent / "data" / "processed" / "symptom_index.json"
-)
-
-# ── Multi-symptom splitting ───────────────────────────────────────────────────
-# Strips clinician/patient framing, then splits compound complaints.
-
-_CLINICIAN_PATS = [
-    r"^my patient (?:has|presents?\s+with|complains?\s+of|reports?|describes?|is\s+(?:experiencing|having|suffering\s+from))\s*",
-    r"^(?:the\s+)?patient (?:has|presents?\s+with|complains?\s+of|reports?|describes?)\s*",
-    r"^(?:he|she|they) (?:has|have|is|are|complains?\s+of|reports?|describes?|presents?\s+with)\s*",
-    r"^presenting with\s*",
-    r"^complaining of\s*",
-    r"^(?:c/o|c\.o\.)\s*",
+FRAMING_PATTERNS = [
+    r"^my patient (has|is)\s+",
+    r"^patient (has|presents with|is complaining of|c/o)\s+",
+    r"^the patient has\s+",
+    r"^i('ve| have) (been |had |been having |been experiencing )?",
+    r"^i am (having|experiencing)\s+",
+    r"^i('m| am) feeling\s+",
+    r"^(presenting|presents) with\s+",
+    r"^complaining of\s+",
+    r"^c/o\s+",
+    r"^(suffering from|diagnosed with|history of)\s+",
+    r"^i am (a )?(\d+[\-\s]year[\-\s]old)\s+(and\s+)?",
 ]
-_PATIENT_PATS = [
-    r"^i (?:have|am\s+having|am\s+experiencing|feel|keep|can't|cannot|suffer\s+from|notice|get)\s*",
-    r"^i've\s+(?:been\s+)?(?:having|experiencing|feeling|getting|noticed)\s*",
-    r"^i\s+(?:am|am\s+currently)\s*",
-    r"^(?:been|feeling)\s*",
-    r"^(?:my|there's)\s*(?:a\s+)?",
-]
-_SPECIAL = re.compile(r"[^\w\s,\.\/\-]")
-_SPACES  = re.compile(r"\s{2,}")
-# Preserves "FEV1/FVC" but splits "breathlessness / chest pain"
-_SPLITTER = re.compile(
-    r"\s*(?:,|;|\band\b|\bwith\b|\bplus\b|\balong\s+with\b|\bas\s+well\s+as\b|\balso\b|(?<!\w)\/(?!\w))\s*",
-    flags=re.IGNORECASE,
+
+STOP_WORDS = {
+    "the", "a", "an", "it", "this", "that", "also", "too", "as well",
+    "i", "me", "my",
+}
+
+SPLIT_RE = re.compile(
+    r',|;|\band\b|\bwith\b|\bplus\b|\balso\b|\bas well as\b'
+    r'|\balong with\b|\bin addition to\b',
+    re.IGNORECASE,
 )
+SENT_RE = re.compile(r'(?<=[.!?])\s+')
 
-
-def _normalise(text: str) -> str:
-    text = text.strip()
-    for pat in _CLINICIAN_PATS:
-        text = re.sub(pat, "", text, flags=re.IGNORECASE)
-    for pat in _PATIENT_PATS:
-        text = re.sub(pat, "", text, flags=re.IGNORECASE)
-    return _SPACES.sub(" ", _SPECIAL.sub(" ", text)).strip().lower()
-
-
-def _split(text: str) -> list[str]:
-    parts = _SPLITTER.split(text)
-    terms = [p.strip() for p in parts if len(p.strip()) >= _MIN_TERM_LEN]
-    return terms if terms else [text.strip()]
-
-
-# ── Client ────────────────────────────────────────────────────────────────────
 
 class QdrantClient:
-    """
-    In-process semantic search over HPO symptom terms.
+    def __init__(self):
+        self._qdrant    = None
+        self._model     = None
+        self._lock      = threading.Lock()
+        self._url       = os.getenv("QDRANT_URL",            "http://localhost:6333")
+        self._coll      = os.getenv("QDRANT_COLLECTION",     "symptoms")
+        self._apikey    = os.getenv("QDRANT_API_KEY",        None) or None
+        self._threshold = MATCH_THRESHOLD
 
-    The name "QdrantClient" is kept for interface compatibility — no Qdrant
-    server is used. Embeddings are computed locally with all-MiniLM-L6-v2
-    and cosine similarity is computed in NumPy.
+    def _get_qdrant(self):
+        if self._qdrant is None:
+            with self._lock:
+                if self._qdrant is None:
+                    from qdrant_client import QdrantClient as _QC
+                    self._qdrant = _QC(url=self._url, api_key=self._apikey)
+        return self._qdrant
 
-    Class-level model and embeddings are shared across all instances so the
-    ~80 MB model is loaded only once per process.
-    """
+    def _get_model(self):
+        if self._model is None:
+            with self._lock:
+                if self._model is None:
+                    from sentence_transformers import SentenceTransformer
+                    import torch
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    self._model = SentenceTransformer(
+                        os.getenv("EMBEDDING_MODEL", "NeuML/pubmedbert-base-embeddings"),
+                        device=device,
+                    )
+        return self._model
 
-    _model:      SentenceTransformer | None = None
-    _embeddings: np.ndarray | None          = None
-    _corpus:     list[tuple[str, str, str]] = []  # (text, clinical_term, hp_id)
+    def _strip_framing(self, sentence: str) -> str:
+        s = sentence.strip()
+        for pat in FRAMING_PATTERNS:
+            s = re.sub(pat, "", s, flags=re.IGNORECASE).strip()
+        return s
 
-    def __init__(self, neo4j_client: Neo4jClient | None = None):
-        self._neo4j = neo4j_client
-        if not QdrantClient._corpus:
-            self._load_corpus()
-
-    # ── Corpus loading ────────────────────────────────────────────────────────
-
-    def _load_corpus(self) -> None:
-        if self._neo4j is not None:
-            try:
-                self._load_from_neo4j()
-                if QdrantClient._corpus:
-                    return
-            except Exception as exc:
-                logger.warning("QdrantClient: Neo4j unavailable (%s) — trying JSON fallback", exc)
-        self._load_from_json()
-
-    def _load_from_neo4j(self) -> None:
-        logger.info("QdrantClient: loading symptom corpus from Neo4j …")
-        with self._neo4j._driver.session() as session:
-            rows = session.run(
-                "MATCH (s:Symptom) WHERE s.category = 'symptom' "
-                "RETURN s.id AS id, s.name AS name, s.synonyms AS synonyms"
-            ).data()
-        self._build(rows)
-        logger.info("QdrantClient: corpus ready — %d entries from Neo4j", len(QdrantClient._corpus))
-
-    def _load_from_json(self) -> None:
-        if not _SYMPTOM_INDEX_JSON.exists():
-            logger.error("QdrantClient: symptom_index.json not found at %s", _SYMPTOM_INDEX_JSON)
-            return
-        logger.info("QdrantClient: loading symptom corpus from %s …", _SYMPTOM_INDEX_JSON)
-        index = json.loads(_SYMPTOM_INDEX_JSON.read_text(encoding="utf-8"))
-        rows  = [
-            {"id": hp_id, "name": info.get("name", ""), "synonyms": info.get("synonyms", [])}
-            for hp_id, info in index.items()
-            if isinstance(info, dict)
-        ]
-        self._build(rows)
-        logger.info("QdrantClient: corpus ready — %d entries from JSON", len(QdrantClient._corpus))
-
-    def _build(self, rows: list[dict]) -> None:
-        corpus: list[tuple[str, str, str]] = []
-        for row in rows:
-            hp_id = row.get("id", "")
-            name  = row.get("name") or ""
-            syns  = row.get("synonyms") or []
-            if not hp_id or not name:
+    def _preprocess(self, query: str) -> list[str]:
+        sentences = SENT_RE.split(query.strip())
+        terms, seen = [], set()
+        for sent in sentences:
+            sent = self._strip_framing(sent)
+            if not sent:
                 continue
-            corpus.append((name, name, hp_id))
-            for syn in syns:
-                if syn and syn != name:
-                    corpus.append((syn, name, hp_id))
-        if not corpus:
-            return
-        if QdrantClient._model is None:
-            logger.info("QdrantClient: loading sentence-transformer '%s' …", _MODEL_NAME)
-            QdrantClient._model = SentenceTransformer(_MODEL_NAME)
-        QdrantClient._embeddings = QdrantClient._model.encode(
-            [e[0] for e in corpus],
+            for part in SPLIT_RE.split(sent):
+                t = part.strip().strip(",.;")
+                if len(t) < 2:
+                    continue
+                if re.fullmatch(r'[\d\s]+', t):
+                    continue
+                if t.lower() in STOP_WORDS:
+                    continue
+                key = t.lower()
+                if key not in seen:
+                    seen.add(key)
+                    terms.append(t)
+        return terms if terms else [query.strip()]
+
+    def _embed(self, texts: list[str]) -> list:
+        return self._get_model().encode(
+            texts,
+            batch_size=int(os.getenv("EMBED_BATCH_SIZE", "32")),
             normalize_embeddings=True,
             show_progress_bar=False,
-            batch_size=256,
+        ).tolist()
+
+    def _search_one(self, vector, limit: int = 5) -> list[dict]:
+        response = self._get_qdrant().query_points(
+            collection_name=self._coll,
+            query=vector,
+            limit=limit,
+            with_payload=True,
         )
-        QdrantClient._corpus = corpus
+        return [
+            {
+                "hp_id":    h.payload["hp_id"],
+                "name":     h.payload["name"],
+                "score":    h.score,
+                "category": h.payload.get("category", "symptom"),
+            }
+            for h in response.points
+        ]
 
-    # ── Public interface ──────────────────────────────────────────────────────
-
-    def search_symptom(self, user_text: str) -> dict:
-        """
-        Map a free-text patient complaint to one or more HPO symptom terms.
-
-        Compound inputs ("chest pain and breathlessness") are split and searched
-        separately. All matches above the similarity threshold are returned in
-        symptom_ids so the orchestrator can union multiple symptom clusters.
-        """
-        fallback = {
-            "clinical_term": "Unknown symptom",
-            "symptom_id":    "HP:0000001",
-            "symptom_ids":   ["HP:0000001"],
+    def _no_match(self) -> dict:
+        return {
+            "clinical_term": None,
+            "symptom_id":    None,
+            "symptom_ids":   [],
             "score":         0.0,
+            "matched":       False,
         }
 
-        if not QdrantClient._corpus or QdrantClient._embeddings is None:
-            logger.warning("QdrantClient: corpus is empty — cannot search")
-            return fallback
+    def search(self, query: str) -> dict:
+        terms   = self._preprocess(query)
+        vectors = self._embed(terms)
 
-        clean = _normalise(user_text)
-        if not clean:
-            return fallback
-        terms = _split(clean)
+        best: dict[str, dict] = {}
+        for vec in vectors:
+            for hit in self._search_one(vec, limit=5):
+                hp = hit["hp_id"]
+                if hp not in best or hit["score"] > best[hp]["score"]:
+                    best[hp] = hit
 
-        best_by_hp: dict[str, dict] = {}
-        for term in terms:
-            q      = QdrantClient._model.encode([term], normalize_embeddings=True)[0]
-            scores = QdrantClient._embeddings @ q
-            idx    = int(np.argmax(scores))
-            score  = float(scores[idx])
-            if score < _SIMILARITY_THRESHOLD:
-                continue
-            _text, clinical_term, hp_id = QdrantClient._corpus[idx]
-            if hp_id not in best_by_hp or score > best_by_hp[hp_id]["score"]:
-                best_by_hp[hp_id] = {
-                    "clinical_term": clinical_term,
-                    "hp_id":         hp_id,
-                    "score":         score,
-                }
+        if not best:
+            return self._no_match()
 
-        if not best_by_hp:
-            return {**fallback, "score": float(
-                (QdrantClient._embeddings @ QdrantClient._model.encode(
-                    [clean], normalize_embeddings=True)[0]).max()
-            )}
+        confident = {hp: h for hp, h in best.items() if h["score"] >= self._threshold}
+        if not confident:
+            return self._no_match()
 
-        ranked = sorted(best_by_hp.values(), key=lambda x: x["score"], reverse=True)
-        ranked = ranked[:_MAX_SYMPTOMS]
-        best   = ranked[0]
-
-        logger.info(
-            "QdrantClient: '%s' → %d HP ID(s) %s (top %.3f)",
-            user_text[:60], len(ranked),
-            [r["hp_id"] for r in ranked], best["score"],
-        )
+        ranked = sorted(confident.values(), key=lambda h: h["score"], reverse=True)
+        top    = ranked[0]
         return {
-            "clinical_term": best["clinical_term"],
-            "symptom_id":    best["hp_id"],
-            "symptom_ids":   [r["hp_id"] for r in ranked],
-            "score":         best["score"],
+            "clinical_term": top["name"],
+            "symptom_id":    top["hp_id"],
+            "symptom_ids":   [h["hp_id"] for h in ranked],
+            "score":         top["score"],
+            "matched":       True,
         }

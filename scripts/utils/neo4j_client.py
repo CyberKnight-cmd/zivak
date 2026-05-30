@@ -22,6 +22,10 @@ def get_driver() -> neo4j.Driver:
         password = os.getenv("NEO4J_PASSWORD")
         if not password:
             raise ValueError("NEO4J_PASSWORD is required but not set in environment")
+        # neo4j+s:// verifies the server certificate which fails on Windows when
+        # the Aura CA chain isn't in the system store. Switching to neo4j+ssc://
+        # keeps the encrypted connection but skips cert verification.
+        uri = uri.replace("neo4j+s://", "neo4j+ssc://").replace("bolt+s://", "bolt+ssc://")
         _driver = neo4j.GraphDatabase.driver(uri, auth=(user, password))
     return _driver
 
