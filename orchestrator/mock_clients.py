@@ -12,8 +12,12 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict
 
-# Threshold below which we consider the symptom unrecognised
-_SIMILARITY_THRESHOLD = 0.30
+# Threshold below which we consider the symptom unrecognised.
+# all-MiniLM-L6-v2 scores for genuine medical terms typically land above 0.45;
+# non-medical phrases ("I love to play") and gibberish fall below it.
+# The real Qdrant client uses 0.60 (pubmedbert), so keep mock slightly lower
+# to account for the weaker general-purpose model.
+_SIMILARITY_THRESHOLD = 0.45
 
 
 class MockQdrantClient:

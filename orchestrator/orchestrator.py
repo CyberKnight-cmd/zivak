@@ -104,6 +104,14 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
 
     symptom_match = qdrant.search(state["user_input"])
 
+    logger.info(
+        "seed: qdrant matched=%s clinical_term=%r score=%.3f symptom_ids=%s",
+        symptom_match.get("matched"),
+        symptom_match.get("clinical_term"),
+        symptom_match.get("score", 0.0),
+        symptom_match.get("symptom_ids", []),
+    )
+
     if not symptom_match["matched"]:
         return {
             "symptom_match":       symptom_match,
@@ -126,9 +134,28 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     differential = engine.initialize(diseases)
 
     logger.info(
-        "seed: symptom=%r n_diseases=%d",
-        symptom_match.get("clinical_term"), len(differential),
+        "seed: symptom=%r n_diseases=%d hp_ids=%s",
+        symptom_match.get("clinical_term"), len(differential), symptom_ids,
     )
+
+    if not differential:
+        logger.warning(
+            "seed: Qdrant matched %r (hp_ids=%s) but Neo4j returned 0 diseases — "
+            "run scripts/7_verify_neo4j.py to check PRESENTS_WITH edge counts",
+            symptom_match.get("clinical_term"), symptom_ids,
+        )
+        return {
+            "symptom_match":       symptom_match,
+            "differential":        [],
+            "evidence_history":    [],
+            "should_finalize":     True,
+            "confidence_warning":  True,
+            "finalization_reason": "no_diseases_found",
+            "error_message": (
+                "Your symptoms were recognised but no diagnostic diseases were found "
+                "in the knowledge base. Please describe your symptoms differently."
+            ),
+        }
 
     return {
         "symptom_match":    symptom_match,
@@ -148,6 +175,15 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     cfg      = config["configurable"]
     neo4j    = cfg["neo4j"]
     selector: QuestionSelectorAgent = cfg["selector"]
+
+    # Guard: seed produced no differential (Qdrant matched but Neo4j has no diseases)
+    if not state.get("differential"):
+        return {
+            "should_finalize":     True,
+            "judge_details":       {"reason": "No diseases in differential after seeding"},
+            "finalization_reason": state.get("finalization_reason") or "no_diseases_found",
+            "confidence_warning":  True,
+        }
 
     engine = _restore_engine(state)
     judge  = ConfidenceJudge()
@@ -441,6 +477,9 @@ class DiagnosticOrchestrator:
             "symptom_match":        snapshot.get("symptom_match", {}),
             "initial_differential": snapshot.get("differential", []),
             "next_question":        self._pending_question(config),
+            "finalization_reason":  snapshot.get("finalization_reason"),
+            "error_message":        snapshot.get("error_message"),
+            "final_diagnosis":      snapshot.get("final_diagnosis"),
         }
 
     def submit_answer(self, session_id: str, answer: str) -> Dict:

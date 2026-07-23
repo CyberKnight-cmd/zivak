@@ -26,6 +26,9 @@ from pydantic import BaseModel, Field
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
+# basicConfig is a no-op if uvicorn already attached handlers to the root logger.
+# Explicitly set the orchestrator namespace so INFO lines are never swallowed.
+logging.getLogger("orchestrator").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
@@ -111,6 +114,7 @@ def start_session(body: StartRequest):
     try:
         session_id, result = _orchestrator.start_session(body.symptom)
 
+        # Case 1: Qdrant found no medical symptom match (gibberish, non-medical text, etc.)
         symptom_match = result.get("symptom_match", {})
         if not symptom_match.get("matched", True):
             return {
@@ -121,9 +125,22 @@ def start_session(body: StartRequest):
                     "Please describe your symptoms more specifically — for example, "
                     "'chest pain', 'shortness of breath', or 'severe headache'."
                 ),
-                "symptom_match":  {"matched": False},
+                "symptom_match":   {"matched": False},
                 "should_continue": False,
                 "final_diagnosis": None,
+            }
+
+        # Case 2: Qdrant matched a symptom but Neo4j has no diseases for those HP IDs.
+        # (distinct from no_symptom_match — the input was medically plausible but the
+        # knowledge graph has no coverage for it)
+        if result.get("finalization_reason") == "no_diseases_found":
+            return {
+                "session_id":          session_id,
+                "finalization_reason": "no_diseases_found",
+                "error_message":       result.get("error_message", "Unable to process your symptoms — please try again."),
+                "symptom_match":       symptom_match,
+                "should_continue":     False,
+                "final_diagnosis":     None,
             }
 
         return result
