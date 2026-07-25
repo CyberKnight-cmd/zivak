@@ -1,6 +1,6 @@
 """
 Evidence Evaluator Agent - Maps answers to diagnostic implications
-Requires: GEMINI_API_KEY_EVALUATOR in .env
+Requires: GROQ_API_KEY_EVALUATOR in .env
 """
 
 import json
@@ -22,13 +22,13 @@ BASE_BACKOFF = 1.0  # seconds — doubles each attempt: 1s, 2s, 4s
 
 def _build_llm(model: str, temperature: float):
     """Return a ChatGoogleGenerativeAI LLM for the Evidence Evaluator."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(
+    from langchain_groq import ChatGroq
+    return ChatGroq(
         model=model,
         temperature=temperature,
-        max_output_tokens=2048,
-        thinking_budget=0,
-        google_api_key=os.getenv("GEMINI_API_KEY_EVALUATOR"),
+        max_tokens=2048,
+        reasoning_format="hidden",
+        api_key=os.getenv("GROQ_API_KEY_EVALUATOR"),
     )
 
 
@@ -53,7 +53,7 @@ class EvidenceEvaluatorAgent:
     because silently dropping a user's answer corrupts the Bayesian differential.
     """
 
-    def __init__(self, model: str = "gemini-2.5-flash", temperature: float = 0):
+    def __init__(self, model: str = "openai/gpt-oss-20b", temperature: float = 0):
         self.llm = _build_llm(model, temperature)
 
     def evaluate(

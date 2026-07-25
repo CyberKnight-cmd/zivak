@@ -1,6 +1,6 @@
 """
 Question Selector Agent - Uses LLM to pick best diagnostic question
-Requires: GEMINI_API_KEY_SELECTOR in .env
+Requires: GROQ_API_KEY_SELECTOR in .env
 """
 
 import json
@@ -22,13 +22,13 @@ BASE_BACKOFF = 1.0  # seconds — doubles each attempt: 1s, 2s, 4s
 
 def _build_llm(model: str, temperature: float):
     """Return a ChatGoogleGenerativeAI LLM for the Question Selector."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(
+    from langchain_groq import ChatGroq
+    return ChatGroq(
         model=model,
         temperature=temperature,
-        max_output_tokens=2048,
-        thinking_budget=0,
-        google_api_key=os.getenv("GEMINI_API_KEY_SELECTOR"),
+        max_tokens=2048,
+        reasoning_format="hidden",
+        api_key=os.getenv("GROQ_API_KEY_SELECTOR"),
     )
 
 
@@ -53,7 +53,7 @@ class QuestionSelectorAgent:
     because a silently wrong question is worse than a visible error.
     """
 
-    def __init__(self, model: str = "gemini-2.5-flash", temperature: float = 1):
+    def __init__(self, model: str = "openai/gpt-oss-20b", temperature: float = 1):
         self.llm = _build_llm(model, temperature)
 
     def select_question(
@@ -134,10 +134,17 @@ class QuestionSelectorAgent:
         # Tests have already been pre-ranked by Expected Information Gain in Python.
         # The LLM's job here is purely: pick the most clinically practical one and
         # phrase the question naturally for a patient.
-        tests_text = "\n".join(
-            f"- {t['name']} (ID: {t['id']})"
-            for t in available_tests
-        )
+        tests_lines = []
+        for t in available_tests:
+            line = f"- {t['name']} (ID: {t['id']})"
+            if test_lr_map and t["id"] in test_lr_map:
+                edges = test_lr_map[t["id"]]
+                if edges:
+                    rules = [f"{e['relationship']} {e['disease']} (LR {e['lr']})" for e in edges]
+                    line += f"\n    Predictive power: {', '.join(rules)}"
+            tests_lines.append(line)
+        
+        tests_text = "\n".join(tests_lines)
 
         return f"""You are ZIVAK's Question Selector Agent.
 

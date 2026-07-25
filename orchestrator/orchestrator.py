@@ -21,6 +21,11 @@ Checkpointer (state persistence):
   langgraph-checkpoint-redis     — production (swap via checkpointer param)
 """
 
+"""
+Orchestrator — LangGraph diagnostic workflow.
+[... unchanged module docstring ...]
+"""
+
 import logging
 import re
 import uuid
@@ -34,6 +39,7 @@ from typing import TypedDict
 
 from agents.evidence_evaluator import EvidenceEvaluatorAgent
 from agents.question_selector import QuestionSelectorAgent
+from agents.symptom_extractor import SymptomExtractorAgent
 from engines.confidence_judge import ConfidenceJudge
 from engines.differential import DifferentialEngine
 from engines.information_gain import rank_by_eig
@@ -43,11 +49,67 @@ logger = logging.getLogger(__name__)
 MAX_QUESTIONS = 10
 MAX_INPUT_LEN = 1000
 
+# --- Phase 1: dynamic differential expansion controls ---
+MAX_NEW_CANDIDATES_PER_EXPANSION = 8   # cap per single expansion event
+MAX_EXPANSIONS_PER_SESSION       = 3   # safety cap on expansion events per session
+MAX_DIFFERENTIAL_SIZE            = 40  # trim lowest-probability overflow after merge
+
+NEGATION_RE = re.compile(
+    r"\b(no|not|never|denies|denied|without|n't|nothing|none)\b",
+    re.IGNORECASE,
+)
+
 
 def _sanitize(text: str) -> str:
-    """Strip control characters and cap length before text enters any LLM prompt."""
     text = text.strip()[:MAX_INPUT_LEN]
     return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+
+def _detect_negation(text: str) -> bool:
+    """
+    Conservative, deterministic negation check for the whole answer.
+
+    Phase-1 approximation: if the answer contains a negation cue anywhere,
+    treat any newly-matched symptom as unconfirmed and skip expansion
+    rather than risk a false-positive candidate injection. This will
+    under-trigger on compound answers like "no weakness, but I do have a
+    rash" — refining per-clause polarity is Phase-3 scope (conversational
+    extraction), noted as a known limitation, not blocking this fix.
+    """
+    return bool(NEGATION_RE.search(text))
+
+
+def _infer_polarity(edges: List[Dict], evidence: Dict) -> Optional[str]:
+    """
+    Deterministically infer whether a test result was POSITIVE or NEGATIVE
+    from the evaluator's already-computed output — no LLM change needed.
+
+    A positive result copies RULES_IN/RULES_OUT edges through unchanged;
+    a negative result inverts and swaps them. So: if any edge's disease
+    appears in evidence['rules_in'] with an edge of type RULES_IN (or in
+    'rules_out' with type RULES_OUT), the result was POSITIVE. If it
+    appears in the opposite list, the result was NEGATIVE.
+
+    Returns None if no edge gives an unambiguous signal (e.g. edges is
+    empty) — replay for that turn then contributes nothing (LR=1), which
+    is the correct neutral fallback anyway.
+    """
+    rules_in  = {r["disease"].lower().strip() for r in evidence.get("rules_in", [])}
+    rules_out = {r["disease"].lower().strip() for r in evidence.get("rules_out", [])}
+
+    for e in edges:
+        key = e["disease"].lower().strip()
+        if e["relationship"] == "RULES_IN":
+            if key in rules_in:
+                return "positive"
+            if key in rules_out:
+                return "negative"
+        else:  # RULES_OUT
+            if key in rules_out:
+                return "positive"
+            if key in rules_in:
+                return "negative"
+    return None
 
 
 # ------------------------------------------------------------------ #
@@ -63,11 +125,13 @@ class DiagnosticState(TypedDict):
     should_finalize:     bool
     judge_details:       Dict
     final_diagnosis:     Optional[Dict]
-    previous_top_prob:   Optional[float]   # top prob snapshot before the last answer
-    pending_question:    Optional[Dict]    # question_node → answer_node handoff (C1 fix)
-    finalization_reason: Optional[str]    # "confidence_gate" | "no_tests" | "max_questions" | "no_symptom_match"
-    confidence_warning:  bool             # top_probability < threshold at termination (M4)
-    error_message:       Optional[str]    # set when finalization_reason == "no_symptom_match"
+    previous_top_prob:   Optional[float]
+    pending_question:    Optional[Dict]
+    finalization_reason: Optional[str]
+    confidence_warning:  bool
+    error_message:       Optional[str]
+    seen_symptom_ids:    List[str]   # every HP id already folded into the differential
+    expansions_used:     int         # count of dynamic-expansion events this session
 
 
 # ------------------------------------------------------------------ #
@@ -75,7 +139,6 @@ class DiagnosticState(TypedDict):
 # ------------------------------------------------------------------ #
 
 def _restore_engine(state: DiagnosticState) -> DifferentialEngine:
-    """Reconstruct DifferentialEngine from persisted state fields."""
     engine = DifferentialEngine()
     engine.differential     = state.get("differential", [])
     engine.evidence_history = state.get("evidence_history", [])
@@ -83,10 +146,15 @@ def _restore_engine(state: DiagnosticState) -> DifferentialEngine:
 
 
 def _top_confidence_warning(state: DiagnosticState) -> bool:
-    """True when the current leader is below the ConfidenceJudge threshold."""
     if not state.get("differential"):
         return True
     return state["differential"][0]["probability"] < ConfidenceJudge().min_top_confidence
+
+
+def _active_ids(differential: List[Dict], threshold: float = 0.03, min_count: int = 8) -> List[str]:
+    above = [d for d in differential if d["probability"] >= threshold]
+    active = above if len(above) >= min_count else differential[:min_count]
+    return [d.get("disease_id", d["name"]) for d in active]
 
 
 # ------------------------------------------------------------------ #
@@ -94,19 +162,21 @@ def _top_confidence_warning(state: DiagnosticState) -> bool:
 # ------------------------------------------------------------------ #
 
 def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
-    """
-    Symptom text → Qdrant semantic search → Neo4j differential seed.
-    Produces the initial probability distribution.
-    """
     cfg    = config["configurable"]
     qdrant = cfg["qdrant"]
     neo4j  = cfg["neo4j"]
+    extractor = cfg["extractor"]
 
-    symptom_match = qdrant.search(state["user_input"])
+    clinical_terms = extractor.extract_symptoms(state["user_input"])
+    # If extraction fails entirely, fallback to the raw user input
+    search_terms = clinical_terms if clinical_terms else state["user_input"]
+
+    symptom_match = qdrant.search(search_terms)
 
     logger.info(
-        "seed: qdrant matched=%s clinical_term=%r score=%.3f symptom_ids=%s",
+        "seed: qdrant matched=%s terms=%r -> clinical_term=%r score=%.3f symptom_ids=%s",
         symptom_match.get("matched"),
+        search_terms,
         symptom_match.get("clinical_term"),
         symptom_match.get("score", 0.0),
         symptom_match.get("symptom_ids", []),
@@ -126,9 +196,22 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             ),
         }
 
-    # Accept both single symptom_id (mock) and symptom_ids list (real Qdrant client).
+    if symptom_match.get("ambiguous"):
+        return {
+            "symptom_match":       symptom_match,
+            "final_diagnosis":     None,
+            "should_finalize":     True,
+            "confidence_warning":  True,
+            "finalization_reason": "ambiguous_symptom",
+            "error_message": (
+                "I want to make sure I understand your main concern correctly. "
+                "Could you describe it in a few words? For example: "
+                "'chest pain', 'shortness of breath', 'dizziness'."
+            ),
+        }
+
     symptom_ids = symptom_match.get("symptom_ids") or [symptom_match["symptom_id"]]
-    diseases    = neo4j.get_initial_differential(symptom_ids)
+    diseases    = neo4j.get_initial_differential(symptom_ids, term=symptom_match.get("clinical_term"))
 
     engine       = DifferentialEngine()
     differential = engine.initialize(diseases)
@@ -155,28 +238,24 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
                 "Your symptoms were recognised but no diagnostic diseases were found "
                 "in the knowledge base. Please describe your symptoms differently."
             ),
+            "seen_symptom_ids": list(symptom_ids),
         }
 
     return {
         "symptom_match":    symptom_match,
         "differential":     differential,
         "evidence_history": engine.evidence_history,
+        "seen_symptom_ids": list(symptom_ids),
+        "expansions_used":  0,
     }
 
 
 def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
-    """
-    Termination check → test pool → question selection → save to state.
-
-    Runs exactly once per question turn. Returns pending_question to state
-    so answer_node can read the correct question on resume without re-running
-    this node (C1 fix — no double selector call).
-    """
+    """UNCHANGED from your current file."""
     cfg      = config["configurable"]
     neo4j    = cfg["neo4j"]
     selector: QuestionSelectorAgent = cfg["selector"]
 
-    # Guard: seed produced no differential (Qdrant matched but Neo4j has no diseases)
     if not state.get("differential"):
         return {
             "should_finalize":     True,
@@ -188,7 +267,6 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     engine = _restore_engine(state)
     judge  = ConfidenceJudge()
 
-    # --- Confidence gate ---
     should_stop, judge_details = judge.should_finalize(
         state["differential"],
         engine.get_evidence_count(),
@@ -203,7 +281,6 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             "confidence_warning":  judge_details.get("confidence_warning", False),
         }
 
-    # --- MAX_QUESTIONS cap ---
     if len(state["questions_asked"]) >= MAX_QUESTIONS:
         logger.warning("question: MAX_QUESTIONS cap reached")
         return {
@@ -213,15 +290,7 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             "confidence_warning":  _top_confidence_warning(state),
         }
 
-    # --- Active differential: P >= 3% OR at least top-8, whichever is larger ---
-    # The threshold prunes implausible diseases as the session converges (~15 → ~3).
-    # The top-8 floor ensures a rare correct diagnosis starting at the 2% prior
-    # floor is never accidentally evicted before it has a chance to be confirmed.
-    _ACTIVE_THRESHOLD = 0.03
-    _ACTIVE_MIN_COUNT = 8
-    above  = [d for d in state["differential"] if d["probability"] >= _ACTIVE_THRESHOLD]
-    active = above if len(above) >= _ACTIVE_MIN_COUNT else state["differential"][:_ACTIVE_MIN_COUNT]
-    active_ids = [d.get("disease_id", d["name"]) for d in active]
+    active_ids = _active_ids(state["differential"])
 
     asked_ids       = {q["test_id"] for q in state["questions_asked"]}
     available_tests = [
@@ -237,10 +306,6 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             "confidence_warning":  _top_confidence_warning(state),
         }
 
-    # --- EIG pre-ranking: fetch edges for all candidates, rank, take top 5 ---
-    # Neo4j returns at most 40 tests (bounded by get_available_tests limit).
-    # Edges are scoped to active diseases to keep each query small.
-    # rank_by_eig() runs in microseconds (pure math, no I/O).
     test_lr_map = {
         t["id"]: neo4j.get_test_edges(t["id"], active_ids)
         for t in available_tests
@@ -249,7 +314,6 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     top_tests = [t for t in available_tests if t["id"] in top_ids]
     top_lr    = {tid: test_lr_map[tid] for tid in top_ids if tid in test_lr_map}
 
-    # Fall back to first available test if EIG returned nothing usable.
     if not top_tests:
         top_tests = available_tests[:1]
         top_lr    = {top_tests[0]["id"]: test_lr_map.get(top_tests[0]["id"], [])}
@@ -265,7 +329,6 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
         or None
     )
 
-    # --- Select question — LLM sees only the 5 EIG-ranked finalists (~400 tokens) ---
     question  = selector.select_question(
         state["differential"],
         top_tests,
@@ -295,46 +358,116 @@ def question_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
 
 def answer_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     """
-    Interrupt → evaluate → Bayesian update.
-
-    Reads pending_question from state (set by question_node), surfaces it to
-    the caller via interrupt(), then on resume evaluates the answer and applies
-    the Bayesian update. Always routes back to question_node.
+    Interrupt → evaluate → Bayesian update → [NEW] dynamic differential
+    expansion from volunteered symptoms.
     """
     cfg       = config["configurable"]
+    qdrant    = cfg["qdrant"]
     neo4j     = cfg["neo4j"]
     evaluator: EvidenceEvaluatorAgent = cfg["evaluator"]
+    extractor: SymptomExtractorAgent  = cfg["extractor"]
 
     question = state["pending_question"]
-
-    # Interrupt: surface question to caller, wait for answer.
-    # First execution: pauses here. On resume: returns the submitted answer.
     answer: str = interrupt(question)
+    clean_answer = _sanitize(str(answer))
 
-    # Snapshot top prob BEFORE this update (for next turn's stability gate).
     pre_update_top = (
         state["differential"][0]["probability"]
         if state.get("differential") else None
     )
 
-    above_ans  = [d for d in state["differential"] if d["probability"] >= 0.03]
-    active_ans = above_ans if len(above_ans) >= 8 else state["differential"][:8]
-    active_ids = [d.get("disease_id", d["name"]) for d in active_ans] or None
+    active_ids = _active_ids(state["differential"]) or None
     edges = neo4j.get_test_edges(question["test_id"], active_ids)
 
-    # Wire test_threshold if the neo4j client provides one (C2 readiness).
     get_threshold  = getattr(neo4j, "get_test_threshold", None)
     test_threshold = get_threshold(question["test_id"]) if get_threshold else None
 
     evidence = evaluator.evaluate(
         question["question"],
-        _sanitize(str(answer)),
+        clean_answer,
         edges,
         test_threshold=test_threshold,
     )
 
+    # Deterministic, no LLM: infer polarity from the evaluator's own output
+    # so this turn's evidence can be replayed later against a new disease.
+    polarity = _infer_polarity(edges, evidence)
+
     engine  = _restore_engine(state)
-    updated = engine.update(evidence)
+    updated = engine.update(evidence, test_id=question["test_id"], polarity=polarity)
+
+    # ---------------------------------------------------------------- #
+    #  NEW: dynamic expansion — check whether the answer volunteered a
+    #  genuinely new symptom that should introduce new disease candidates.
+    # ---------------------------------------------------------------- #
+    seen_symptom_ids = list(state.get("seen_symptom_ids", []))
+    expansions_used  = state.get("expansions_used", 0)
+
+    if expansions_used < MAX_EXPANSIONS_PER_SESSION and not _detect_negation(clean_answer):
+        extracted_terms = extractor.extract_symptoms(clean_answer)
+        search_terms = extracted_terms if extracted_terms else clean_answer
+        match = qdrant.search(search_terms)
+        
+        new_hp_ids = [
+            hp for hp in match.get("symptom_ids", [])
+            if match.get("matched") and hp not in seen_symptom_ids
+        ]
+
+        for hp_id in new_hp_ids:
+            if expansions_used >= MAX_EXPANSIONS_PER_SESSION:
+                break
+
+            raw_candidates = neo4j.get_initial_differential([hp_id])
+            existing_keys  = {d.get("disease_id", d["name"]) for d in updated}
+            new_candidates = [
+                d for d in raw_candidates
+                if d.get("disease_id", d["name"]) not in existing_keys
+            ]
+            seen_symptom_ids.append(hp_id)
+
+            if not new_candidates:
+                continue  # nothing genuinely new for this symptom — still mark it seen
+
+            new_ids = [d.get("disease_id", d["name"]) for d in new_candidates][:MAX_NEW_CANDIDATES_PER_EXPANSION]
+
+            # Fetch replay edges: for every historical evidence event with a
+            # known test_id, get the LR these new candidates would have had.
+            replay_edges: Dict[str, List[Dict]] = {}
+            for entry in engine.evidence_history:
+                t_id = entry.get("test_id")
+                if t_id and t_id not in replay_edges:
+                    replay_edges[t_id] = neo4j.get_test_edges(t_id, new_ids)
+
+            updated = engine.expand(
+                new_candidates,
+                replay_edges,
+                max_new=MAX_NEW_CANDIDATES_PER_EXPANSION,
+            )
+            expansions_used += 1
+
+            # Apply the volunteered symptom itself as an ordinary positive
+            # finding, scoped to the full (now-expanded) differential.
+            full_ids  = [d.get("disease_id", d["name"]) for d in updated]
+            new_edges = neo4j.get_test_edges(hp_id, full_ids)
+            if new_edges:
+                symptom_evidence = {
+                    "rules_in":  [{"disease": e["disease"], "likelihood_ratio": e["lr"]}
+                                  for e in new_edges if e["relationship"] == "RULES_IN"],
+                    "rules_out": [{"disease": e["disease"], "likelihood_ratio": e["lr"]}
+                                  for e in new_edges if e["relationship"] == "RULES_OUT"],
+                }
+                updated = engine.update(symptom_evidence, test_id=hp_id, polarity="positive")
+
+            # Bound total differential size — trim lowest-probability overflow.
+            if len(updated) > MAX_DIFFERENTIAL_SIZE:
+                updated = sorted(updated, key=lambda d: d["probability"], reverse=True)
+                updated = updated[:MAX_DIFFERENTIAL_SIZE]
+                engine.differential = updated
+
+            logger.info(
+                "answer: expansion #%d via %s introduced %d candidate(s)",
+                expansions_used, hp_id, len(new_candidates[:MAX_NEW_CANDIDATES_PER_EXPANSION]),
+            )
 
     logger.info(
         "answer: n_evidence=%d top=%s(%.2f)",
@@ -349,11 +482,13 @@ def answer_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
         "questions_asked":   state["questions_asked"] + [question],
         "pending_question":  None,
         "previous_top_prob": pre_update_top,
+        "seen_symptom_ids":  seen_symptom_ids,
+        "expansions_used":   expansions_used,
     }
 
 
 def finalize_node(state: DiagnosticState) -> Dict:
-    """Compile the final diagnosis report from completed state."""
+    """UNCHANGED from your current file."""
     if not state.get("differential"):
         return {"final_diagnosis": {"error": "No differential available"}}
 
@@ -382,17 +517,15 @@ def finalize_node(state: DiagnosticState) -> Dict:
 
 
 # ------------------------------------------------------------------ #
-#  Graph compilation                                                   #
+#  Graph compilation — UNCHANGED                                       #
 # ------------------------------------------------------------------ #
 
 def _build_graph(checkpointer):
     builder = StateGraph(DiagnosticState)
-
     builder.add_node("seed",     seed_node)
     builder.add_node("question", question_node)
     builder.add_node("answer",   answer_node)
     builder.add_node("finalize", finalize_node)
-
     builder.add_edge(START,      "seed")
     builder.add_edge("seed",     "question")
     builder.add_conditional_edges(
@@ -401,55 +534,25 @@ def _build_graph(checkpointer):
     )
     builder.add_edge("answer",   "question")
     builder.add_edge("finalize", END)
-
     return builder.compile(checkpointer=checkpointer)
 
-
-# ------------------------------------------------------------------ #
-#  Public API                                                          #
-# ------------------------------------------------------------------ #
 
 class SessionNotFoundError(Exception):
     pass
 
 
 class DiagnosticOrchestrator:
-    """
-    Thin wrapper around the LangGraph diagnostic graph.
-
-    Agents are instantiated once here and injected via configurable
-    so LangGraph nodes remain pure functions (no hidden state).
-
-    Usage:
-        orch = DiagnosticOrchestrator(qdrant, neo4j)
-        session_id, result = orch.start_session("chest feels heavy")
-        question = result["next_question"]
-
-        while question:
-            answer = get_answer_from_user(question)
-            result = orch.submit_answer(session_id, answer)
-            question = result["next_question"]
-
-        report = result["final_diagnosis"]
-    """
+    """UNCHANGED except start_session's initial state dict below."""
 
     def __init__(self, qdrant_client, neo4j_client, checkpointer=None):
         self._qdrant    = qdrant_client
         self._neo4j     = neo4j_client
         self._selector  = QuestionSelectorAgent()
         self._evaluator = EvidenceEvaluatorAgent()
+        self._extractor = SymptomExtractorAgent()
         self._graph     = _build_graph(checkpointer or MemorySaver())
 
-    # ---------------------------------------------------------------- #
-
     def start_session(self, user_input: str) -> Tuple[str, Dict]:
-        """
-        Start a new diagnostic session.
-
-        Runs seed → question_node (select Q1) → answer_node interrupt.
-        Returns (session_id, result) where result['next_question'] is the
-        first question ready for the user.
-        """
         user_input = _sanitize(user_input)
         session_id = str(uuid.uuid4())
         config     = self._config(session_id)
@@ -468,6 +571,8 @@ class DiagnosticOrchestrator:
             "finalization_reason": None,
             "confidence_warning":  False,
             "error_message":       None,
+            "seen_symptom_ids":    [],
+            "expansions_used":     0,
         }
 
         snapshot = self._graph.invoke(initial, config)
@@ -483,18 +588,7 @@ class DiagnosticOrchestrator:
         }
 
     def submit_answer(self, session_id: str, answer: str) -> Dict:
-        """
-        Resume the graph with the user's answer to the current question.
-
-        Raises:
-            SessionNotFoundError: if session_id does not exist in the
-                                  checkpointer (C3 fix — was returning 503).
-
-        Returns updated differential and the next question (None if done).
-        """
         config = self._config(session_id)
-
-        # C3 fix: detect dead/unknown sessions before attempting resume.
         state = self._graph.get_state(config)
         if not state or not state.values:
             raise SessionNotFoundError(f"No active session: {session_id}")
@@ -514,12 +608,9 @@ class DiagnosticOrchestrator:
         }
 
     def get_final_diagnosis(self, session_id: str) -> Dict:
-        """Return the final diagnosis from a completed session."""
         snapshot = self._graph.get_state(self._config(session_id))
         result   = snapshot.values.get("final_diagnosis")
         return result or {"error": "Session not finalized yet"}
-
-    # ---------------------------------------------------------------- #
 
     def _config(self, session_id: str) -> Dict:
         return {
@@ -529,11 +620,11 @@ class DiagnosticOrchestrator:
                 "neo4j":     self._neo4j,
                 "selector":  self._selector,
                 "evaluator": self._evaluator,
+                "extractor": self._extractor,
             }
         }
 
     def _pending_question(self, config: Dict) -> Optional[Dict]:
-        """Extract the interrupt value (the pending question) from graph state."""
         state = self._graph.get_state(config)
         if state.tasks and state.tasks[0].interrupts:
             return state.tasks[0].interrupts[0].value
