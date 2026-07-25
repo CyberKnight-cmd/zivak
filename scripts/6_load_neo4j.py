@@ -180,15 +180,8 @@ def part_d_edges():
     MERGE (s)-[r:RULES_IN]->(d)
     SET r.likelihood_ratio = row.rules_in_lr
     """
-    ro_query = """
-    UNWIND $batch AS row
-    MATCH (d:Disease {id: row.doid})
-    MATCH (s:Symptom {id: row.hp_id})
-    MERGE (s)-[r:RULES_OUT]->(d)
-    SET r.likelihood_ratio = row.rules_out_lr
-    """
 
-    pw_batch, ri_batch, ro_batch = [], [], []
+    pw_batch, ri_batch = [], []
     edges_processed  = 0
     skipped_empty    = 0
     reclassified:    list[dict] = []
@@ -260,21 +253,18 @@ def part_d_edges():
             }
             pw_batch.append(record)
             ri_batch.append(record)
-            ro_batch.append(record)
 
             if len(pw_batch) >= BATCH_SIZE:
                 run_write_batch(pw_query, pw_batch)
                 run_write_batch(ri_query, ri_batch)
-                run_write_batch(ro_query, ro_batch)
                 edges_processed += len(pw_batch)
-                pw_batch, ri_batch, ro_batch = [], [], []
+                pw_batch, ri_batch = [], []
                 if edges_processed % 5000 == 0:
                     print(f"  Processed {edges_processed} edge rows ...")
 
     if pw_batch:
         run_write_batch(pw_query, pw_batch)
         run_write_batch(ri_query, ri_batch)
-        run_write_batch(ro_query, ro_batch)
         edges_processed += len(pw_batch)
 
     # Write all four output files

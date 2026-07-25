@@ -4,50 +4,19 @@ Semantic symptom search backed by a real Qdrant vector database.
 
 Model: NeuML/pubmedbert-base-embeddings (768d, PubMed fine-tuned)
 Collection: "symptoms"  (populated by scripts/5_populate_qdrant.py)
-
-search() return contract:
-  Match (score >= threshold):
-    {"clinical_term": "Exertional dyspnea", "symptom_id": "HP:0002875",
-     "symptom_ids": ["HP:0002875", ...], "score": 0.87, "matched": True}
-  No match (all scores below threshold or empty):
-    {"clinical_term": None, "symptom_id": None,
-     "symptom_ids": [], "score": 0.0, "matched": False}
 """
 
 from __future__ import annotations
 
 import os
-import re
 import threading
+from typing import List, Union
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MATCH_THRESHOLD = float(os.getenv("QDRANT_MATCH_THRESHOLD", "0.60"))
-
-FRAMING_PATTERNS = [
-    r"^my patient (has|is)\s+",
-    r"^patient (has|presents with|is complaining of|c/o)\s+",
-    r"^the patient has\s+",
-    r"^i('ve| have) (been |had |been having |been experiencing )?",
-    r"^i am (having|experiencing)\s+",
-    r"^i('m| am) feeling\s+",
-    r"^(presenting|presents) with\s+",
-    r"^complaining of\s+",
-    r"^c/o\s+",
-    r"^(suffering from|diagnosed with|history of)\s+",
-    r"^i am (a )?(\d+[\-\s]year[\-\s]old)\s+(and\s+)?",
-]
-
-STOP_WORDS = {
-    "the", "a", "an", "it", "this", "that", "also", "too", "as well",
-    "i", "me", "my",
-}
-
-SPLIT_RE = re.compile(
-    r',|;|\band\b|\bwith\b|\bplus\b|\balso\b|\bas well as\b'
-    r'|\balong with\b|\bin addition to\b',
-    re.IGNORECASE,
-)
-SENT_RE = re.compile(r'(?<=[.!?])\s+')
-
+MARGIN_THRESHOLD = float(os.getenv("QDRANT_MARGIN_THRESHOLD", "0.04"))
 
 class QdrantClient:
     def __init__(self):
@@ -80,33 +49,6 @@ class QdrantClient:
                     )
         return self._model
 
-    def _strip_framing(self, sentence: str) -> str:
-        s = sentence.strip()
-        for pat in FRAMING_PATTERNS:
-            s = re.sub(pat, "", s, flags=re.IGNORECASE).strip()
-        return s
-
-    def _preprocess(self, query: str) -> list[str]:
-        sentences = SENT_RE.split(query.strip())
-        terms, seen = [], set()
-        for sent in sentences:
-            sent = self._strip_framing(sent)
-            if not sent:
-                continue
-            for part in SPLIT_RE.split(sent):
-                t = part.strip().strip(",.;")
-                if len(t) < 2:
-                    continue
-                if re.fullmatch(r'[\d\s]+', t):
-                    continue
-                if t.lower() in STOP_WORDS:
-                    continue
-                key = t.lower()
-                if key not in seen:
-                    seen.add(key)
-                    terms.append(t)
-        return terms if terms else [query.strip()]
-
     def _embed(self, texts: list[str]) -> list:
         return self._get_model().encode(
             texts,
@@ -138,33 +80,60 @@ class QdrantClient:
             "symptom_id":    None,
             "symptom_ids":   [],
             "score":         0.0,
+            "margin":        0.0,
+            "ambiguous":     False,
             "matched":       False,
         }
 
-    def search(self, query: str) -> dict:
-        terms   = self._preprocess(query)
-        vectors = self._embed(terms)
-
-        best: dict[str, dict] = {}
-        for vec in vectors:
-            for hit in self._search_one(vec, limit=5):
-                hp = hit["hp_id"]
-                if hp not in best or hit["score"] > best[hp]["score"]:
-                    best[hp] = hit
-
-        if not best:
+    def search(self, terms: Union[str, List[str]]) -> dict:
+        """
+        Search Qdrant for a term or list of terms.
+        Terms should be clean clinical concepts (e.g. from SymptomExtractorAgent),
+        not raw conversational text.
+        """
+        if isinstance(terms, str):
+            terms = [terms]
+            
+        if not terms:
             return self._no_match()
 
-        confident = {hp: h for hp, h in best.items() if h["score"] >= self._threshold}
-        if not confident:
+        all_confident = []
+        ambiguous = False
+        
+        for term in terms:
+            vec = self._embed([term])[0]
+            hits = self._search_one(vec, limit=5)
+            
+            if not hits:
+                continue
+                
+            # Margin check per term: if the top 2 hits are too close, the term match is ambiguous
+            if len(hits) > 1:
+                margin = hits[0]["score"] - hits[1]["score"]
+                if margin < MARGIN_THRESHOLD:
+                    ambiguous = True
+                    
+            if hits[0]["score"] >= self._threshold:
+                all_confident.append(hits[0])
+
+        if not all_confident:
             return self._no_match()
 
-        ranked = sorted(confident.values(), key=lambda h: h["score"], reverse=True)
-        top    = ranked[0]
+        # Sort all confident hits by score globally
+        ranked = sorted(all_confident, key=lambda h: h["score"], reverse=True)
+        top = ranked[0]
+        
+        # Collect unique symptom IDs across all confident terms
+        unique_ids = []
+        for h in ranked:
+            if h["hp_id"] not in unique_ids:
+                unique_ids.append(h["hp_id"])
+
         return {
-            "clinical_term": top["name"],
+            "clinical_term": top["name"], # Highest scoring name across all terms
             "symptom_id":    top["hp_id"],
-            "symptom_ids":   [h["hp_id"] for h in ranked],
+            "symptom_ids":   unique_ids,  # All confident unique HP IDs found
             "score":         top["score"],
+            "ambiguous":     ambiguous,
             "matched":       True,
         }

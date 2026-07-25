@@ -39,6 +39,7 @@ from typing import TypedDict
 
 from agents.evidence_evaluator import EvidenceEvaluatorAgent
 from agents.question_selector import QuestionSelectorAgent
+from agents.symptom_extractor import SymptomExtractorAgent
 from engines.confidence_judge import ConfidenceJudge
 from engines.differential import DifferentialEngine
 from engines.information_gain import rank_by_eig
@@ -164,12 +165,18 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     cfg    = config["configurable"]
     qdrant = cfg["qdrant"]
     neo4j  = cfg["neo4j"]
+    extractor = cfg["extractor"]
 
-    symptom_match = qdrant.search(state["user_input"])
+    clinical_terms = extractor.extract_symptoms(state["user_input"])
+    # If extraction fails entirely, fallback to the raw user input
+    search_terms = clinical_terms if clinical_terms else state["user_input"]
+
+    symptom_match = qdrant.search(search_terms)
 
     logger.info(
-        "seed: qdrant matched=%s clinical_term=%r score=%.3f symptom_ids=%s",
+        "seed: qdrant matched=%s terms=%r -> clinical_term=%r score=%.3f symptom_ids=%s",
         symptom_match.get("matched"),
+        search_terms,
         symptom_match.get("clinical_term"),
         symptom_match.get("score", 0.0),
         symptom_match.get("symptom_ids", []),
@@ -189,8 +196,22 @@ def seed_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
             ),
         }
 
+    if symptom_match.get("ambiguous"):
+        return {
+            "symptom_match":       symptom_match,
+            "final_diagnosis":     None,
+            "should_finalize":     True,
+            "confidence_warning":  True,
+            "finalization_reason": "ambiguous_symptom",
+            "error_message": (
+                "I want to make sure I understand your main concern correctly. "
+                "Could you describe it in a few words? For example: "
+                "'chest pain', 'shortness of breath', 'dizziness'."
+            ),
+        }
+
     symptom_ids = symptom_match.get("symptom_ids") or [symptom_match["symptom_id"]]
-    diseases    = neo4j.get_initial_differential(symptom_ids)
+    diseases    = neo4j.get_initial_differential(symptom_ids, term=symptom_match.get("clinical_term"))
 
     engine       = DifferentialEngine()
     differential = engine.initialize(diseases)
@@ -344,6 +365,7 @@ def answer_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     qdrant    = cfg["qdrant"]
     neo4j     = cfg["neo4j"]
     evaluator: EvidenceEvaluatorAgent = cfg["evaluator"]
+    extractor: SymptomExtractorAgent  = cfg["extractor"]
 
     question = state["pending_question"]
     answer: str = interrupt(question)
@@ -382,7 +404,10 @@ def answer_node(state: DiagnosticState, config: RunnableConfig) -> Dict:
     expansions_used  = state.get("expansions_used", 0)
 
     if expansions_used < MAX_EXPANSIONS_PER_SESSION and not _detect_negation(clean_answer):
-        match = qdrant.search(clean_answer)
+        extracted_terms = extractor.extract_symptoms(clean_answer)
+        search_terms = extracted_terms if extracted_terms else clean_answer
+        match = qdrant.search(search_terms)
+        
         new_hp_ids = [
             hp for hp in match.get("symptom_ids", [])
             if match.get("matched") and hp not in seen_symptom_ids
@@ -524,6 +549,7 @@ class DiagnosticOrchestrator:
         self._neo4j     = neo4j_client
         self._selector  = QuestionSelectorAgent()
         self._evaluator = EvidenceEvaluatorAgent()
+        self._extractor = SymptomExtractorAgent()
         self._graph     = _build_graph(checkpointer or MemorySaver())
 
     def start_session(self, user_input: str) -> Tuple[str, Dict]:
@@ -594,6 +620,7 @@ class DiagnosticOrchestrator:
                 "neo4j":     self._neo4j,
                 "selector":  self._selector,
                 "evaluator": self._evaluator,
+                "extractor": self._extractor,
             }
         }
 

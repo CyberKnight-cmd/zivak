@@ -61,6 +61,7 @@ class Neo4jClient:
         self,
         symptom_id_or_ids: Union[str, list],
         limit: int = 20,
+        term: str = None,
     ) -> list[dict]:
         """
         Seed the Bayesian differential from one or more presenting symptom HP IDs.
@@ -83,7 +84,7 @@ class Neo4jClient:
         with self._driver.session() as session:
             rows = session.run(
                 """
-                MATCH (d:Disease)-[r]-(s:Symptom)
+                MATCH (d:Disease)-[r:PRESENTS_WITH]->(s:Symptom)
                 WHERE s.id IN $hp_ids
                 RETURN d.id          AS disease_id,
                        d.name        AS name,
@@ -106,6 +107,33 @@ class Neo4jClient:
             for r in rows
         ] if rows else []
 
+        if not results and term:
+            # Fallback: search by text in symptom names and synonyms
+            with self._driver.session() as session:
+                rows = session.run(
+                    """
+                    MATCH (d:Disease)-[r:PRESENTS_WITH]->(s:Symptom)
+                    WHERE toLower(s.name) CONTAINS toLower($term)
+                       OR ANY(syn IN s.synonyms WHERE toLower(syn) CONTAINS toLower($term))
+                    RETURN d.id          AS disease_id,
+                           d.name        AS name,
+                           d.prevalence  AS prevalence,
+                           SUM(COALESCE(r.sensitivity, 0.1)) AS score
+                    ORDER BY score DESC
+                    LIMIT $limit
+                    """,
+                    term=term, limit=limit
+                ).data()
+            results = [
+                {
+                    "name":        r["name"],
+                    "disease_id":  r["disease_id"],
+                    "specificity": float(r["score"]),
+                    "prevalence":  float(r["prevalence"] or 0.01),
+                }
+                for r in rows
+            ]
+
         # Rare disease floor — always runs even when rows is empty so a
         # symptom that has no direct disease links still seeds the differential.
         present_ids = {d["disease_id"] for d in results}
@@ -116,7 +144,7 @@ class Neo4jClient:
         with self._driver.session() as session:
             rare_rows = session.run(
                 """
-                MATCH (d:Disease)-[r]-(s:Symptom)
+                MATCH (d:Disease)-[r:PRESENTS_WITH]->(s:Symptom)
                 WHERE d.prevalence < $threshold
                   AND NOT d.id IN $present_ids
                   AND s.id IN $hp_ids
@@ -221,22 +249,9 @@ class Neo4jClient:
                 disease_ids=disease_ids or [],
             ).data()
 
-            out_rows = session.run(
-                f"""
-                MATCH (s:Symptom {{id: $hp_id}})-[r:RULES_OUT]->(d:Disease)
-                WHERE 1=1 {filter_clause}
-                RETURN d.name AS disease, r.likelihood_ratio AS lr
-                """,
-                hp_id=hp_id,
-                disease_ids=disease_ids or [],
-            ).data()
-
         return [
             {"disease": r["disease"], "relationship": "RULES_IN",  "lr": float(r["lr"])}
             for r in in_rows
-        ] + [
-            {"disease": r["disease"], "relationship": "RULES_OUT", "lr": float(r["lr"])}
-            for r in out_rows
         ]
 
     # ------------------------------------------------------------------ #

@@ -5,6 +5,7 @@ No LLM required - pure mathematics
 
 import logging
 import math
+
 from typing import Dict, List, Optional
 from copy import deepcopy
 
