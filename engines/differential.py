@@ -145,10 +145,13 @@ class DifferentialEngine:
             )
 
         log_lr_map: Dict[str, float] = {}
+        # Dampen the log-LR to mitigate Naive Bayes overconfidence (correlated symptoms)
+        # This resolves the issue of 'increment in score is too much' for LRs like 15.4.
+        DAMPENING = 0.5
         for rule in evidence.get("rules_in", []) + evidence.get("rules_out", []):
             key = rule["disease"].lower().strip()
             lr = max(rule["likelihood_ratio"], MIN_LR)
-            log_lr_map[key] = log_lr_map.get(key, 0.0) + math.log(lr)
+            log_lr_map[key] = log_lr_map.get(key, 0.0) + (math.log(lr) * DAMPENING)
 
         for disease in self.differential:
             key = disease["name"].lower().strip()
@@ -268,7 +271,7 @@ class DifferentialEngine:
                 edges = replay_edges.get(test_id, [])
                 lr = self._resolve_lr(edges, d["name"], polarity)
                 if lr is not None:
-                    cum += math.log(max(lr, MIN_LR))
+                    cum += (math.log(max(lr, MIN_LR)) * 0.5)  # Apply same DAMPENING
             d["cum_log_lr"] = cum
 
         union = self.differential + candidates

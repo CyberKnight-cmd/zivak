@@ -380,7 +380,7 @@ class MockNeo4jClient:
             {"disease": "Vestibular Neuritis","relationship": "RULES_OUT", "lr": 0.6},
         ],
         "test_tymp": [
-            {"disease": "Meniere's Disease", "relationship": "RULES_IN",  "lr": 4.0},
+            {"disease": "Meniere's Disease", "relationship": "RULES_OUT", "lr": 0.2},
             {"disease": "BPPV",             "relationship": "RULES_OUT", "lr": 0.6},
         ],
         "test_mri": [

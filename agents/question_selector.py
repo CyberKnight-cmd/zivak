@@ -134,10 +134,17 @@ class QuestionSelectorAgent:
         # Tests have already been pre-ranked by Expected Information Gain in Python.
         # The LLM's job here is purely: pick the most clinically practical one and
         # phrase the question naturally for a patient.
-        tests_text = "\n".join(
-            f"- {t['name']} (ID: {t['id']})"
-            for t in available_tests
-        )
+        tests_lines = []
+        for t in available_tests:
+            line = f"- {t['name']} (ID: {t['id']})"
+            if test_lr_map and t["id"] in test_lr_map:
+                edges = test_lr_map[t["id"]]
+                if edges:
+                    rules = [f"{e['relationship']} {e['disease']} (LR {e['lr']})" for e in edges]
+                    line += f"\n    Predictive power: {', '.join(rules)}"
+            tests_lines.append(line)
+        
+        tests_text = "\n".join(tests_lines)
 
         return f"""You are ZIVAK's Question Selector Agent.
 

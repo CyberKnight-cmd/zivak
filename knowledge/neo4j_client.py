@@ -83,12 +83,12 @@ class Neo4jClient:
         with self._driver.session() as session:
             rows = session.run(
                 """
-                MATCH (d:Disease)-[r:PRESENTS_WITH]->(s:Symptom)
+                MATCH (d:Disease)-[r]-(s:Symptom)
                 WHERE s.id IN $hp_ids
                 RETURN d.id          AS disease_id,
                        d.name        AS name,
                        d.prevalence  AS prevalence,
-                       SUM(r.sensitivity) AS score
+                       SUM(COALESCE(r.sensitivity, 0.1)) AS score
                 ORDER BY score DESC
                 LIMIT $limit
                 """,
@@ -116,7 +116,7 @@ class Neo4jClient:
         with self._driver.session() as session:
             rare_rows = session.run(
                 """
-                MATCH (d:Disease)-[:PRESENTS_WITH]->(s:Symptom)
+                MATCH (d:Disease)-[r]-(s:Symptom)
                 WHERE d.prevalence < $threshold
                   AND NOT d.id IN $present_ids
                   AND s.id IN $hp_ids
