@@ -47,6 +47,11 @@ async def lifespan(app: FastAPI):
 
     use_mock = os.getenv("USE_MOCK", "true").lower() != "false"
     qdrant, neo4j = get_clients(use_mock=use_mock)
+    
+    if not use_mock and hasattr(qdrant, "_get_model"):
+        logger.info("Downloading and warming up embedding model...")
+        qdrant._get_model()
+        
     _orchestrator = DiagnosticOrchestrator(qdrant, neo4j)
     logger.info("Orchestrator ready (mock=%s)", use_mock)
     yield
